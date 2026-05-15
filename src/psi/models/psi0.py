@@ -1528,6 +1528,9 @@ class Psi0Model(nn.Module):
         # init empty vlm backbone from config only (skip loading base pretrained weights)
         vlm_config = AutoConfig.from_pretrained(QWEN3VL_VARIANT)
         vlm_config._attn_implementation = "flash_attention_2"
+        vlm_config.dtype = torch.bfloat16
+        vlm_config.vision_config.dtype = torch.bfloat16
+        vlm_config.text_config.dtype = torch.bfloat16
         vlm_model = Qwen3VLForConditionalGeneration(vlm_config)
         vlm_model = vlm_model.to(dtype=torch.bfloat16) # type: ignore
 
