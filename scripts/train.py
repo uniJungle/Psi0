@@ -258,7 +258,7 @@ def train(config: LaunchConfig):
 
                 # validation
                 if config.train.validation_steps > 0 and (
-                        global_step % config.train.validation_steps == 0 or 
+                        (global_step + 1) % config.train.validation_steps == 0 or 
                         global_step == trainer.max_training_steps - 1
                     ) :
                     gc.collect()
