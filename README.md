@@ -55,7 +55,7 @@ At the top, the $\Psi_0$ model consists of two end-to-end trained components: a 
 - [Reproduce Ψ₀: Pre-Training and Post-Training](#pre-post-train)
 - [Checkpoints](#checkpoints)
 - [Troubleshootings](#troubleshootings)
-- [Citation](#️-citation)
+- [Citation](#citation)
 
 <a id="finetune-psi0"></a>
 ## Finetune Ψ₀ on Unitree G1 Humanoid Robot
