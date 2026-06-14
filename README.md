@@ -21,6 +21,9 @@ Contributors: [Songlin Wei](https://songlin.github.io/), [Hongyi Jing](https://h
 
 $\Psi_0$ is an open vision-language-action (VLA) model for dexterous humanoid loco-manipulation. Our model first learns task semantics and visual representation from large-scale human egocentic videos, and then is post-trained on a smaller amount of real-world teleoperated robot data, to learn general dynamics of the embodiment. 
 
+<details>
+<summary>[Optional] Expand to know more about Ψ₀.</summary>
+
 Our foundation model is capable of acquiring new long-horizontal dexterous loco-manipulation skill by fine-tuning using as few as 80 trajectories. ***Our key finding is that scaling the right data in the right way.***
 
 At the top, the $\Psi_0$ model consists of two end-to-end trained components: a vision–language backbone (System-2) and a multimodal diffusion transformer (System-1) action expert. The backbone is based on Qwen’s Qwen3-VL-2B-Instruct, which extracts vision–language features from observations and instructions. These features condition a flow-based multimodal diffusion transformer inspired by Stable Diffusion 3. The action expert (≈500M parameters) predicts future whole-body action chunks, enabling efficient fusion of visual, linguistic, and action representations. At the lowest level (System-0), an RL-based tracking controller executes the predicted lower-body action commands, ensuring stable and precise physical control.
@@ -28,6 +31,16 @@ At the top, the $\Psi_0$ model consists of two end-to-end trained components: a 
 <p align="center">
   <img src="assets/media/arch.png" alt="Psi0 model" />
 </p>
+</details>
+
+<p></p>
+
+## 📢 News & Updates
+
+* [2026-06-13] Released SONIC integration for Psi-0.
+* [2026-06-03] 🎉🎉🎉 Psi-0 won the Best Paper Award at the 2nd 3D-LLM/VLA Workshop at CVPR 2026.
+
+
 
 ## Table of Contents
 <!-- - [Installation](#-environment-setup) -->
@@ -39,6 +52,7 @@ At the top, the $\Psi_0$ model consists of two end-to-end trained components: a 
   - [Fine-Tuning](#training-real)
   - [Open-Loop Evaluation](#open-loop-evaluation)
   - [Deployment](#deployment)
+  - [Ψ₀ with SONIC](#psi0-sonic)
 - [Baselines](#baselines)
   - [GR00T N1.6](#groot-n16)
   - [OpenPi π0.5](#openpi-05)
@@ -55,7 +69,7 @@ At the top, the $\Psi_0$ model consists of two end-to-end trained components: a 
 - [Reproduce Ψ₀: Pre-Training and Post-Training](#pre-post-train)
 - [Checkpoints](#checkpoints)
 - [Troubleshootings](#troubleshootings)
-- [Citation](#citation)
+- [Citation](#️-citation)
 
 <a id="finetune-psi0"></a>
 ## Finetune Ψ₀ on Unitree G1 Humanoid Robot
@@ -250,6 +264,81 @@ For detailed real-world deployment environment setup, please also refer to the d
 
 [Real-World Teleoperation Guide](real/README.md)
 
+
+<a id="psi0-sonic"></a>
+### Ψ₀ with SONIC
+
+[SONIC](https://github.com/NVlabs/GR00T-WholeBodyControl) is a powerful whole-body controller for humanoid robots. $\Psi_0$ now supports data collection, fine-tuning, and deployment with SONIC. Please use [our fork](https://github.com/physical-superintelligence-lab/GR00T-WholeBodyControl/tree/main) to avoid any compatibility issues.
+
+Initialize the SONIC submodule first:
+
+```bash
+git submodule update --init --recursive third_party/GR00T-WholeBodyControl
+```
+
+For the full environment setup — workstation venvs, TensorRT + C++ build, PICO/XRoboToolkit, and the robot-side camera server — see the **[SONIC real-world teleoperation guide](real/SONIC/README.md)**.
+
+#### Data collection
+
+Please follow the [SONIC real-world teleoperation guide](real/SONIC/README.md#data-collection) to record demonstrations.
+
+Datasets are saved locally under `third_party/GR00T-WholeBodyControl/outputs/<dataset-name>/` in LeRobot format.
+
+#### Pre-Processing: Convert to $\Psi_0$ LeRobot Format
+
+Convert the SONIC-collected dataset into the $\Psi_0$ LeRobot format:
+
+```bash
+export task=<dataset-name>
+
+python scripts/data/raw_sonic_to_psi_lerobot.py \
+  --data-root=third_party/GR00T-WholeBodyControl/outputs/$task \
+  --work-dir=$PSI_HOME/data/sonic/lerobot \
+  --repo-id=$task \
+  --robot-type=g1
+```
+
+Calculate stats
+```bash
+python scripts/data/calc_modality_stats.py \
+  --work-dir=$PSI_HOME/data/sonic/lerobot \
+  --task=$task
+```
+
+Create **$\Psi_0$** format stats (simply a copy for now)
+```bash
+cp $PSI_HOME/data/sonic/lerobot/$task/meta/stats.json $PSI_HOME/data/sonic/lerobot/$task/meta/stats_psi0.json
+```
+
+Now it's ready to fine-tune.
+
+#### Finetune $\Psi_0$ with SONIC
+
+```bash
+bash ./scripts/train/psi0/finetune-real-sonic-psi0.sh $task
+```
+
+#### Deploy $\Psi_0$ with SONIC
+
+Please follow the [SONIC real-world deployment guide](real/SONIC/DEPLOYMENT.md) for detailed instructions.
+
+##### Serve Policy Server of $\Psi_0$ with SONIC (RTC mode)
+
+```bash
+bash ./scripts/deploy/serve_psi0-rtc-sonic.sh
+```
+
+##### Start whole-body controller on robot for $\Psi_0$ with SONIC (RTC mode)
+
+```bash
+bash ./real/scripts/deploy_psi0-sonic-rtc-robot.sh
+```
+
+##### Start Policy Client of $\Psi_0$ with SONIC (RTC mode)
+
+```bash
+bash ./real/scripts/deploy_psi0-sonic-rtc-client.sh
+```
 
 ## Baselines
 
@@ -607,22 +696,11 @@ GIT_LFS_SKIP_SMUDGE=1 uv ...
 ```
 ## Citation
 
-> Please also consider citing `SIMPLE` if you use our simulation.
-
 ```
 @article{wei2026psi0,
   title={{$\Psi_0$}: An Open Foundation Model Towards Universal Humanoid Loco-Manipulation},
   author={Wei, Songlin and Jing, Hongyi and Li, Boqian and Zhao, Zhenyu and Mao, Jiageng and Ni, Zhenhao and He, Sicheng and Liu, Jie and Liu, Xiawei and Kang, Kaidi and others},
   journal={arXiv preprint arXiv:2603.12263},
-  year={2026}
-}
-```
-
-```
-@article{wei2026simple,
-  title={SIMPLE: Simulation-Based Policy Learning and Evaluation for Humanoid Loco-manipulation},
-  author={Wei, Songlin and Ni, Zhenhao and Liu, Jie and Zhao, Zhenyu and Ye, Junjie and Jing, Hongyi and Xia, Junkai and Liu, Xiawei and Leong, Michael and Heng, Liang and Huang, Di and Wang, Yue},
-  journal={arXiv preprint arXiv:2606.08278},
   year={2026}
 }
 ```
