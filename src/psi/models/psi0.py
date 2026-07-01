@@ -1836,7 +1836,7 @@ class Psi0Model(nn.Module):
             for i, timestep in enumerate(self.noise_scheduler.timesteps):
                 # batched_timestep = timestep.expand(bsz).to(self.device).detach()
 
-                batched_timestep_masked = torch.where(prefix_mask, 0, timestep).to(self.device) # shape (B, H)
+                batched_timestep_masked = torch.where(prefix_mask, 0, timestep.to(self.device)) # shape (B, H)
 
                 # replace action_samples with clean prev_actions when prefix_mask == True
                 action_samples = torch.where(prefix_mask[:, :, None], prev_actions, action_samples)
