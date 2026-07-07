@@ -34,7 +34,8 @@ class Server:
         enable_rtc: bool = False,
         action_exec_horizon: int | None = None
     ):
-        if not torch.cuda.is_available():
+        _dt = str(device).split(":")[0]
+        if _dt == "cuda" and not torch.cuda.is_available():
             raise RuntimeError("CUDA is not available. Please check your CUDA installation.")
          
         self.device = torch.device(device)

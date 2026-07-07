@@ -1527,7 +1527,12 @@ class Psi0Model(nn.Module):
 
         # init empty vlm backbone from config only (skip loading base pretrained weights)
         vlm_config = AutoConfig.from_pretrained(QWEN3VL_VARIANT)
-        vlm_config._attn_implementation = "flash_attention_2"
+        # Attention backend: flash_attention_2 on CUDA (if installed), sdpa on XPU/CPU.
+        try:
+            from transformers.utils import is_flash_attn_2_available
+            vlm_config._attn_implementation = "flash_attention_2" if is_flash_attn_2_available() else "sdpa"
+        except Exception:
+            vlm_config._attn_implementation = "sdpa"
         vlm_config.dtype = torch.bfloat16
         vlm_config.vision_config.dtype = torch.bfloat16
         vlm_config.text_config.dtype = torch.bfloat16
@@ -1693,7 +1698,7 @@ class Psi0Model(nn.Module):
         batch_pixel_values = torch.stack(batch_pixel_values) # (B, 256, 1536)
         batch_image_grid_thw = torch.stack(batch_image_grid_thw) # (B, 3)
 
-        with torch.autocast("cuda", dtype=torch.bfloat16):
+        with torch.autocast(str(self.device).split(":")[0], dtype=torch.bfloat16):
             # extract vision + language features
             output = self.vlm_model(
                 input_ids=batch_input_ids,
@@ -1807,7 +1812,7 @@ class Psi0Model(nn.Module):
         batch_pixel_values = torch.stack(batch_pixel_values) # (B, 256, 1536)
         batch_image_grid_thw = torch.stack(batch_image_grid_thw) # (B, 3)
 
-        with torch.autocast("cuda", dtype=torch.bfloat16):
+        with torch.autocast(str(self.device).split(":")[0], dtype=torch.bfloat16):
             # extract vision + language features
             output = self.vlm_model(
                 input_ids=batch_input_ids,
@@ -1940,7 +1945,7 @@ class Psi0Model(nn.Module):
             batch_pixel_values = torch.stack(batch_pixel_values) # (B, 256, 1536)
             batch_image_grid_thw = torch.stack(batch_image_grid_thw) # (B, 3)
 
-            with torch.autocast("cuda", dtype=torch.bfloat16):
+            with torch.autocast(str(self.device).split(":")[0], dtype=torch.bfloat16):
                 # extract vision + language features
                 output = self.vlm_model(
                     input_ids=batch_input_ids,
@@ -2122,7 +2127,7 @@ class Psi0Model(nn.Module):
             batch_pixel_values = torch.stack(batch_pixel_values) # (B, 256, 1536)
             batch_image_grid_thw = torch.stack(batch_image_grid_thw) # (B, 3)
 
-            with torch.autocast("cuda", dtype=torch.bfloat16):
+            with torch.autocast(str(self.device).split(":")[0], dtype=torch.bfloat16):
                 # extract vision + language features
                 output = self.vlm_model(
                     input_ids=batch_input_ids,
@@ -2267,7 +2272,7 @@ class Psi0Model(nn.Module):
             batch_pixel_values = torch.stack(batch_pixel_values) # (B, 256, 1536)
             batch_image_grid_thw = torch.stack(batch_image_grid_thw) # (B, 3)
 
-            with torch.autocast("cuda", dtype=torch.bfloat16):
+            with torch.autocast(str(self.device).split(":")[0], dtype=torch.bfloat16):
                 # extract vision + language features
                 output = self.vlm_model(
                     input_ids=batch_input_ids,
