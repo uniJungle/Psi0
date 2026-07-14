@@ -37,6 +37,7 @@ At the top, the $\Psi_0$ model consists of two end-to-end trained components: a 
 
 ## 📢 News & Updates
 
+* [2026-07-14] Released DreamZero baseline for SIMPLE.
 * [2026-06-13] Released SONIC integration for Psi-0.
 * [2026-06-03] 🎉🎉🎉 Psi-0 won the Best Paper Award at the 2nd 3D-LLM/VLA Workshop at CVPR 2026.
 
