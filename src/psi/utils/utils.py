@@ -446,3 +446,22 @@ def pad_to_len(x, target_len, dim=1, pad_value=0.0):
     idx[dim] = slice(current_len, target_len)
     mask[tuple(idx)] = False
     return padded, mask
+
+def dreamzero_instantiate(config, *args, **kwargs):
+    from hydra.utils import instantiate
+    from omegaconf import DictConfig, OmegaConf
+
+    def _patch(obj):
+        if hasattr(obj, "items"):
+            if "_target_" in obj and isinstance(obj["_target_"], str) and obj["_target_"].startswith("groot."):
+                obj["_target_"] = "dreamzero." + obj["_target_"]
+            for k in obj.keys():
+                if isinstance(obj, DictConfig) and OmegaConf.is_missing(obj, k):
+                    continue
+                _patch(obj[k])
+        elif isinstance(obj, (list, tuple)) or (hasattr(obj, "__iter__") and not isinstance(obj, str)):
+            for v in obj:
+                _patch(v)
+
+    _patch(config)
+    return instantiate(config, *args, **kwargs)

@@ -16,7 +16,7 @@ fi
 RUN_DIR=$1
 CKPT_STEP=$2
 
-uv run --active --group psi --group serve serve_psi0 \
+serve_psi0 \
     --host 0.0.0.0 \
     --port 22085 \
     --policy=psi0 \
