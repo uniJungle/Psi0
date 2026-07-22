@@ -56,9 +56,21 @@ bash ./real/SONIC/scripts/collect_psi0-sonic-data-manual.sh deploy
 
 ### 3. Launch the PICO teleoperation system
 ```bash
+# 默认：--eef brainco --dds-interface enp4s0（可不写）
 bash ./real/SONIC/scripts/collect_psi0-sonic-data-manual.sh pico
+
+# 显式指定（换网卡 / 关手控时）
+bash ./real/SONIC/scripts/collect_psi0-sonic-data-manual.sh pico \
+    --eef brainco \
+    --dds-interface enp4s0
+
+bash ./real/SONIC/scripts/collect_psi0-sonic-data-manual.sh pico --eef none
 ```
 
+PICO 进程默认启用 **Brainco** 双手开合（左右 trigger：0=张开，1=闭合）。前提：
+- `.venv_teleop` 已安装 `unitree_sdk2py`（`bash install_scripts/install_pico.sh`）
+- 机器人侧 Brainco DDS 服务正常（`rt/brainco/{left,right}/state`）
+- DDS 网卡名与 `--dds-interface` 一致（默认 `enp4s0`）
 ### 4. Launch the data recording/export script
 ```bash
 bash ./real/SONIC/scripts/collect_psi0-sonic-data-manual.sh exporter \
@@ -83,10 +95,14 @@ bash ./real/SONIC/scripts/collect_psi0-sonic-data.sh \
    - **右手 B**：遥操暂停 ↔ 恢复遥操（不要同时按 A/X/Y 或左 grip）
    - **B+Y**：进入 / 退出「上半身冻结规划」
    - **A+B+X+Y**：急停并退出策略
-3. **录制 episode**（PICO）：
+3. **双手开合**（Brainco，PICO；manager 启动后即可用，不必先 A+B+X+Y）：
+   - **左 trigger**：左手开合（松开=张开，按下=闭合）
+   - **右 trigger**：右手开合
+   - 终端应周期性打印 `[Brainco] trigger L=.. R=..`；若有打印但手不动，查机器人 `brainco_hand` / DDS 网卡
+4. **录制 episode**（PICO）：
    - **left grip + A**：开始 / 停止录制
    - **left grip + B**：丢弃当前 episode（仍会落盘，并在 `meta/info.json` 的 `discarded_episode_indices` 中标记）
-4. **数据保存路径**（默认）：
+5. **数据保存路径**（默认）：
    ```
    /<root-output-dir>/<task_name>/<YYYY-MM-DD>/
    ├── data/chunk-000/episode_XXXXXX.parquet

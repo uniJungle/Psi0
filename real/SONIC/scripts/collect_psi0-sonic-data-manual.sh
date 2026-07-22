@@ -8,6 +8,11 @@
 #   bash ./real/SONIC/scripts/collect_psi0-sonic-data-manual.sh pico       # 2) PICO streamer
 #   bash ./real/SONIC/scripts/collect_psi0-sonic-data-manual.sh exporter   # 3) data exporter (records)
 #
+# PICO options (defaults: Brainco on enp4s0):
+#   bash ./real/SONIC/scripts/collect_psi0-sonic-data-manual.sh pico \
+#       --eef brainco --dds-interface enp4s0
+#   bash ./real/SONIC/scripts/collect_psi0-sonic-data-manual.sh pico --eef none
+#
 # Simulation teleop test (no robot/camera, no recording):
 #   bash ./real/SONIC/scripts/collect_psi0-sonic-data-manual.sh sim         # 1) MuJoCo sim
 #   bash ./real/SONIC/scripts/collect_psi0-sonic-data-manual.sh deploy sim  # 2) C++ controller (sim)
@@ -18,13 +23,23 @@ TASK="Pick bottle and turn and pour into cup."
 TASK_NAME="pick_bottle"
 FPS=30
 OUTPUT_DIR="/home/karthus_chen/ycb_ws/datasets/SONIC"
+EEF="brainco"
+DDS_INTERFACE="enp4s0"
 
 SONIC_DIR="$(cd "$(dirname "$0")/../../../third_party/GR00T-WholeBodyControl" && pwd)"
 cd "$SONIC_DIR"
 
+USAGE="Usage: $0 {sim|deploy [sim]|pico|exporter} [options]
+Options:
+  --task-prompt TEXT
+  --task-name NAME
+  --root-output-dir DIR
+  --eef {none|brainco}          (pico; default: brainco)
+  --dds-interface IFACE         (pico; default: enp4s0)"
+
 MODE="${1:-}"
 if [ -z "$MODE" ]; then
-    echo "Usage: $0 {sim|deploy [sim]|pico|exporter} [--task-prompt TEXT] [--task-name NAME] [--root-output-dir DIR]"
+    echo "$USAGE"
     exit 1
 fi
 shift
@@ -51,9 +66,17 @@ while [ $# -gt 0 ]; do
             OUTPUT_DIR="$2"
             shift 2
             ;;
+        --eef)
+            EEF="$2"
+            shift 2
+            ;;
+        --dds-interface)
+            DDS_INTERFACE="$2"
+            shift 2
+            ;;
         *)
             echo "Unknown argument: $1"
-            echo "Usage: $0 {sim|deploy [sim]|pico|exporter} [--task-prompt TEXT] [--task-name NAME] [--root-output-dir DIR]"
+            echo "$USAGE"
             exit 1
             ;;
     esac
@@ -71,7 +94,9 @@ case "$MODE" in
         ;;
     pico)
         source .venv_teleop/bin/activate
-        python gear_sonic/scripts/pico_manager_thread_server.py --manager
+        echo "[pico] eef=$EEF dds-interface=$DDS_INTERFACE"
+        python gear_sonic/scripts/pico_manager_thread_server.py \
+            --manager --eef "$EEF" --dds-interface "$DDS_INTERFACE"
         ;;
     exporter)
         mkdir -p "$OUTPUT_DIR"
@@ -85,7 +110,7 @@ case "$MODE" in
             --record-stereo-ego
         ;;
     *)
-        echo "Usage: $0 {sim|deploy [sim]|pico|exporter} [--task-prompt TEXT] [--root-output-dir DIR]"
+        echo "$USAGE"
         exit 1
         ;;
 esac

@@ -21,6 +21,8 @@ TASK="Pick bottle and turn and pour into cup."
 TASK_NAME="pick_bottle"
 FPS=30
 OUTPUT_DIR="/home/karthus_chen/ycb_ws/datasets/SONIC"
+EEF="brainco"
+DDS_INTERFACE="enp4s0"
 
 SONIC_DIR="$(cd "$(dirname "$0")/../../../third_party/GR00T-WholeBodyControl" && pwd)"
 cd "$SONIC_DIR"
@@ -44,9 +46,17 @@ while [ $# -gt 0 ]; do
             OUTPUT_DIR="$2"
             shift 2
             ;;
+        --eef)
+            EEF="$2"
+            shift 2
+            ;;
+        --dds-interface)
+            DDS_INTERFACE="$2"
+            shift 2
+            ;;
         --*)
             echo "Unknown argument: $1"
-            echo "Usage: $0 [sim|<ROBOT_IP>] [--task-prompt TEXT] [--task-name NAME] [--root-output-dir DIR]"
+            echo "Usage: $0 [sim|<ROBOT_IP>] [--task-prompt TEXT] [--task-name NAME] [--root-output-dir DIR] [--eef none|brainco] [--dds-interface IFACE]"
             exit 1
             ;;
         *)
@@ -73,7 +83,7 @@ if [ "$MODE" = "sim" ]; then
 
     tmux split-window -v -t "${SESSION}:0.1" -c "$SONIC_DIR"
     tmux send-keys -t "${SESSION}:0.2" \
-        "source .venv_teleop/bin/activate && python gear_sonic/scripts/pico_manager_thread_server.py --manager" C-m
+        "source .venv_teleop/bin/activate && python gear_sonic/scripts/pico_manager_thread_server.py --manager --eef ${EEF} --dds-interface ${DDS_INTERFACE}" C-m
 
     tmux select-layout -t "$SESSION" tiled
     tmux attach -t "$SESSION"
@@ -94,6 +104,8 @@ else
         --data-exporter-frequency "$FPS" \
         --root-output-dir "$OUTPUT_DIR" \
         --record-stereo-ego \
+        --pico-eef "$EEF" \
+        --pico-dds-interface "$DDS_INTERFACE" \
         --no-camera-viewer
 
     kill "$PREVIEW_PID" 2>/dev/null
