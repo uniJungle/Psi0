@@ -38,13 +38,17 @@ scp -r gear_sonic/camera unitree@192.168.123.164:~/SONIC_psi0_release/gear_sonic
 scp real/SONIC/realsense_server.py unitree@192.168.123.164:~/SONIC_psi0_release/
 ```
 
-Start the server on the robot (keep it running):
+Start the server on the robot (keep it running). For a **USB head stereo** camera (1280×480 side-by-side):
 
 ```bash
 conda activate vision
 cd ~/SONIC_psi0_release
-python -m gear_sonic.camera.composed_camera --ego-view-camera realsense --port 5555
+python -m gear_sonic.camera.composed_camera \
+    --ego-view-camera usb_stereo --ego-view-device-id 0 \
+    --port 5555
 ```
+
+This publishes two streams: `ego_view_left` and `ego_view_right`, each 640×480.
 
 ## Run
 

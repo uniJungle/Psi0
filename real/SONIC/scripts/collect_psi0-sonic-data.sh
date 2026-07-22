@@ -4,22 +4,57 @@
 #
 #   sim mode  : lightweight teleop test in MuJoCo — no camera render, no recording.
 #   real mode : full data collection — starts the C++ controller, PICO streamer,
-#               and data exporter, recording LeRobot datasets under outputs/.
+#               and data exporter, recording LeRobot datasets under OUTPUT_DIR/.
 #
 # Usage:
 #   ./collect_psi0-sonic-data.sh              # real robot (camera server at $ROBOT_IP)
 #   ./collect_psi0-sonic-data.sh sim          # simulation teleop test (no recording)
-#   ./collect_psi0-sonic-data.sh <ROBOT_IP>   # real robot at a specific IP
+#   ./collect_psi0-sonic-data.sh 192.168.123.164
+#   ./collect_psi0-sonic-data.sh --task-prompt "Pick bottle and pour."
+#   ./collect_psi0-sonic-data.sh --root-output-dir /home/karthus_chen/ycb_ws/datasets/SONIC
+#   ./collect_psi0-sonic-data.sh 192.168.123.164 \
+#       --task-prompt "Pick bottle and pour." \
+#       --root-output-dir /home/karthus_chen/ycb_ws/datasets/SONIC
 
 ROBOT_IP=192.168.123.164
 TASK="Pick bottle and turn and pour into cup."
-FPS=30   # recording frequency (Hz); 30 matches the RealSense camera so no duplicate frames
+TASK_NAME="pick_bottle"
+FPS=30
+OUTPUT_DIR="/home/karthus_chen/ycb_ws/datasets/SONIC"
 
-# Everything lives in the GR00T-WholeBodyControl (sonic) submodule root.
 SONIC_DIR="$(cd "$(dirname "$0")/../../../third_party/GR00T-WholeBodyControl" && pwd)"
 cd "$SONIC_DIR"
 
-MODE="${1:-$ROBOT_IP}"
+MODE="$ROBOT_IP"
+while [ $# -gt 0 ]; do
+    case "$1" in
+        sim)
+            MODE="sim"
+            shift
+            ;;
+        --task-prompt)
+            TASK="$2"
+            shift 2
+            ;;
+        --task-name)
+            TASK_NAME="$2"
+            shift 2
+            ;;
+        --root-output-dir)
+            OUTPUT_DIR="$2"
+            shift 2
+            ;;
+        --*)
+            echo "Unknown argument: $1"
+            echo "Usage: $0 [sim|<ROBOT_IP>] [--task-prompt TEXT] [--task-name NAME] [--root-output-dir DIR]"
+            exit 1
+            ;;
+        *)
+            MODE="$1"
+            shift
+            ;;
+    esac
+done
 
 if [ "$MODE" = "sim" ]; then
     # Sim: teleop only. Plain run_sim_loop (no --enable-image-publish/--enable-offscreen),
@@ -46,6 +81,8 @@ else
     # Real robot: full data collection.
     # The launcher's built-in preview runs in the data-collection venv (lerobot's headless
     # OpenCV, no window), so disable it and run a working preview from .venv_teleop alongside.
+    mkdir -p "$OUTPUT_DIR"
+
     ( source .venv_teleop/bin/activate && \
       python gear_sonic/scripts/run_camera_viewer.py --camera-host "$MODE" --camera-port 5555 ) &
     PREVIEW_PID=$!
@@ -53,7 +90,10 @@ else
     python gear_sonic/scripts/launch_data_collection.py \
         --camera-host "$MODE" \
         --task-prompt "$TASK" \
+        --task-name "$TASK_NAME" \
         --data-exporter-frequency "$FPS" \
+        --root-output-dir "$OUTPUT_DIR" \
+        --record-stereo-ego \
         --no-camera-viewer
 
     kill "$PREVIEW_PID" 2>/dev/null
