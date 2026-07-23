@@ -429,7 +429,10 @@ cd "$(dirname "$0")/../../third_party/GR00T-WholeBodyControl"
 
 那么就看一下 psi_rtc_sonic_client.py 是怎么获取到动作然后发布的。
 
+### 仿真回放
+
 需要先在mujoco中启动仿真，启动控制器，最后启动回放数据集
+
 ```bash
 # MuJoCo
 bash ./real/SONIC/scripts/collect_psi0-sonic-data-manual.sh sim
@@ -446,4 +449,23 @@ python scripts/replay/replay_sim.py
 ```bash
 python scripts/replay/replay_sim.py --mode token --episode_idx 0
 ```
-一切正常，只不过需要预加载数据集到内存中。
+一切正常，只不过需要预加载数据集到内存中，这个可能是因为要过一层NAS，所以比较慢。
+
+### 真机回放
+```bash
+# 方式 1: 用采数时的控制器 (collect_psi0-sonic-data-manual.sh)
+# 先在机器人上启动：
+bash ./real/SONIC/scripts/collect_psi0-sonic-data-manual.sh deploy
+
+# 再在工作站上回放：
+python scripts/replay/replay_real.py --mode token --episode_idx 0 --input_type zmq_manager
+
+# 方式 2: 用真机推理部署的控制器 (deploy_psi0-sonic-rtc-robot.sh)
+# 先在机器人上启动：
+bash ./real/scripts/deploy_psi0-sonic-rtc-robot.sh
+# 当看到 "Init done." 时，可以按 **]** 按钮让机器人站立。之后按 **ENTER** 键开始部署策略。部署完成后，再次按 **ENTER** 键停止策略并让机器人恢复默认姿态。
+
+# 再在工作站上回放：
+python scripts/replay/replay_real.py --mode token --episode_idx 0 --input_type manager
+```
+
