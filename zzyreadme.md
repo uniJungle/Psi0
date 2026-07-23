@@ -399,3 +399,51 @@ bash ./real/SONIC/scripts/collect_psi0-sonic-data-manual.sh exporter \
     --task-prompt "Pick bottle and pour into cup." \
     --root-output-dir /home/karthus_chen/ycb_ws/datasets/SONIC
 ```
+
+## 5.3 数据回放
+回放应该使用和推理时一样的逻辑，所以微调就先不看了，直接去看他怎么进行的推理，模型输出是怎么下发到机器人的。
+
+1. 在机器人上启动全身控制器（保持运行）：
+```bash
+bash ./real/scripts/deploy_psi0-sonic-rtc-robot.sh
+```
+2. 工作站上启动策略客户端：
+```bash
+bash ./real/scripts/deploy_psi0-sonic-rtc-client.sh
+```
+内部启动的脚本：
+```sh
+PORT=8014
+# INSTRUCTION="Spray the bowl and wipe it and stack it up."
+# INSTRUCTION="Pick toys into box and lift and turn and put on the chair new"
+INSTRUCTION="pick up the green grapes and place it into the green bowl"
+
+# psi_rtc_sonic_client.py lives at the GR00T-WholeBodyControl (sonic) submodule root
+cd "$(dirname "$0")/../../third_party/GR00T-WholeBodyControl"
+
+# Run in SONIC's .venv_teleop (has gear_sonic + cv2 + zmq + msgpack; websocket-client added for the psi0 RTC client)
+./.venv_teleop/bin/python psi_rtc_sonic_client.py \
+    --port "$PORT" \
+    --instruction "$INSTRUCTION"
+```
+
+那么就看一下 psi_rtc_sonic_client.py 是怎么获取到动作然后发布的。
+
+需要先在mujoco中启动仿真，启动控制器，最后启动回放数据集
+```bash
+# MuJoCo
+bash ./real/SONIC/scripts/collect_psi0-sonic-data-manual.sh sim
+
+# C++ 控制器（仿真）
+bash ./real/SONIC/scripts/collect_psi0-sonic-data-manual.sh deploy sim
+
+# 回放数据集
+python scripts/replay/replay_sim.py 
+```
+通信建立正常，但是直接发送action.wbc，机器人动作不对。
+
+研究发现，客户端发送的是action_motion_token，这个是发给底层控制器的东西，而不是直接发送关节。
+```bash
+python scripts/replay/replay_sim.py --mode token --episode_idx 0
+```
+一切正常，只不过需要预加载数据集到内存中。
