@@ -1,6 +1,6 @@
-# SONIC Whole-body Teleoperation Guideline
+# SONIC 全身遥操作指南
 
-## SONIC submodule
+## SONIC 子模块
 
 本指南依赖的 GR00T / SONIC 改动在 [uniJungle/GR00T-WholeBodyControl](https://github.com/uniJungle/GR00T-WholeBodyControl) 的 `g1_setup` 分支：
 
@@ -11,181 +11,204 @@ git fetch origin
 git checkout g1_setup
 ```
 
-## Pre-processing
-```bash
-conda activate vision
-pip install msgpack msgpack-numpy tyro
-```
+Brainco 灵巧手在 SONIC 数采中的安装、通信机制与依赖说明见：[real/SONIC/BRAINCO_HAND.md](real/SONIC/BRAINCO_HAND.md)。
 
-Copy the SONIC camera module from the workstation (run from the submodule root; G1 default IP `192.168.123.164`):
+## 预处理
 
-```bash
-ssh unitree@192.168.123.164 mkdir -p ~/SONIC_psi0_release/gear_sonic
-scp gear_sonic/__init__.py gear_sonic/version.py unitree@192.168.123.164:~/SONIC_psi0_release/gear_sonic/
-scp -r gear_sonic/camera unitree@192.168.123.164:~/SONIC_psi0_release/gear_sonic/
-scp real/SONIC/realsense_server.py unitree@192.168.123.164:~/SONIC_psi0_release/
-```
+1. 在机器人上创建相机所需的 conda 环境（G1 默认 IP `192.168.123.164`）：
 
-## Launch all required scripts in order
-### 1. Launch the G1 onboard image server
-Start the server on the robot (keep it running). For a **USB head stereo** camera (1280×480 side-by-side):
+    ```bash
+    ssh unitree@192.168.123.164
+    conda activate vision
+    pip install msgpack msgpack-numpy tyro
+    ```
 
-```bash
-ssh unitree@192.168.123.164
-conda activate vision
-cd ~/SONIC_psi0_release
+2. 从工作站拷贝 SONIC 相机模块到机器人（在 submodule 根目录执行）：
 
-# This publishes two streams: `ego_view_left` and `ego_view_right`, each 640×480.
-python -m gear_sonic.camera.composed_camera \
-    --ego-view-camera usb_stereo --ego-view-device-id 0 \
-    --port 5555
+    ```bash
+    ssh unitree@192.168.123.164 mkdir -p ~/SONIC_psi0_release/gear_sonic
+    scp gear_sonic/__init__.py gear_sonic/version.py unitree@192.168.123.164:~/SONIC_psi0_release/gear_sonic/
+    scp -r gear_sonic/camera unitree@192.168.123.164:~/SONIC_psi0_release/gear_sonic/
+    scp real/SONIC/realsense_server.py unitree@192.168.123.164:~/SONIC_psi0_release/
+    ```
 
-# Check the image stream
-cd ~/ycb_ws/Psi0/third_party/GR00T-WholeBodyControl
-source .venv_teleop/bin/activate
+## 按顺序启动所需脚本
 
-python gear_sonic/scripts/run_camera_viewer.py \
-    --camera-host 192.168.123.164 \
-    --camera-port 5555
-```
+### 1. 启动 G1 机载图像服务与 Brainco 手部服务
 
-### 2. Launch the SONIC C++ cotroller
+1. 通过 tmux 一并启动两个服务：
+
+    ```bash
+    ssh unitree@192.168.123.164
+    bash ./sonic_start_teleop.sh
+    ```
+
+2. 仅启动图像服务：
+
+    ```bash
+    ssh unitree@192.168.123.164
+    conda activate vision
+    cd ~/SONIC_psi0_release
+
+    # 发布双目流：`ego_view_left` / `ego_view_right`，各 640×480
+    python -m gear_sonic.camera.composed_camera \
+        --ego-view-camera usb_stereo --ego-view-device-id 0 \
+        --port 5555
+
+    # 发布单目流：`ego_view`，640×480
+    python -m gear_sonic.camera.composed_camera \
+        --ego-view-camera usb --ego-view-device-id 0 \
+        --port 5555
+
+    # 在工作站检查相机画面
+    cd ~/ycb_ws/Psi0/third_party/GR00T-WholeBodyControl
+    source .venv_teleop/bin/activate
+
+    python gear_sonic/scripts/run_camera_viewer.py \
+        --camera-host 192.168.123.164 \
+        --camera-port 5555
+    ```
+
+3. 仅启动 Brainco 手部服务：
+
+    ```bash
+    ssh unitree@192.168.123.164
+
+    sudo systemctl start brainco_hand && systemctl is-active brainco_hand
+    ```
+
+### 2. 启动 SONIC C++ 控制器
+
 ```bash
 bash ./real/SONIC/scripts/collect_psi0-sonic-data-manual.sh deploy
 ```
 
-### 3. Launch the PICO teleoperation system
-```bash
-# 默认：--eef brainco --dds-interface enp4s0（可不写）
-bash ./real/SONIC/scripts/collect_psi0-sonic-data-manual.sh pico
+### 3. 启动 PICO 遥操作系统
 
-# 显式指定（换网卡 / 关手控时）
+```bash
 bash ./real/SONIC/scripts/collect_psi0-sonic-data-manual.sh pico \
     --eef brainco \
     --dds-interface enp4s0
 
+# 关闭手控
 bash ./real/SONIC/scripts/collect_psi0-sonic-data-manual.sh pico --eef none
 ```
 
-PICO 进程默认启用 **Brainco** 双手开合（左右 trigger：0=张开，1=闭合）。前提：
-- `.venv_teleop` 已安装 `unitree_sdk2py`（`bash install_scripts/install_pico.sh`）
-- 机器人侧 Brainco DDS 服务正常（`rt/brainco/{left,right}/state`）
-- DDS 网卡名与 `--dds-interface` 一致（默认 `enp4s0`）
-### 4. Launch the data recording/export script
+安装、DDS 通信与依赖见 [BRAINCO_HAND.md](real/SONIC/BRAINCO_HAND.md)。
+
+### 4. 启动数据录制 / 导出脚本
+
 ```bash
+# 双目：ego_view_left / ego_view_right
 bash ./real/SONIC/scripts/collect_psi0-sonic-data-manual.sh exporter \
     --task-prompt "Pick bottle and pour into cup." \
     --task-name "test" \
-    --root-output-dir /home/karthus_chen/ycb_ws/datasets/SONIC
-```
+    --root-output-dir /home/karthus_chen/ycb_ws/datasets/SONIC \
+    --use-stereo-camera \
+    --eef brainco
 
-### For step 2~4, run mutiple panes by tmux in a single terminal
-```bash
-bash ./real/SONIC/scripts/collect_psi0-sonic-data.sh \
+# 单目：ego_view
+bash ./real/SONIC/scripts/collect_psi0-sonic-data-manual.sh exporter \
     --task-prompt "Pick bottle and pour into cup." \
     --task-name "test" \
-    --root-output-dir /home/karthus_chen/ycb_ws/datasets/SONIC
+    --root-output-dir /home/karthus_chen/ycb_ws/datasets/SONIC \
+    --use-mono-camera \
+    --eef brainco
 ```
 
-## Data Collection
+## 数据采集
 
 1. **进入遥操作**（deploy 终端 / PICO）：校准姿态 → **A+B+X+Y** → **A+X**
 2. **模式切换**（PICO，在已启动策略后）：
-   - **A+X**：遥操（POSE）↔ 规划（PLANNER）
-   - **右手 B**：遥操暂停 ↔ 恢复遥操（不要同时按 A/X/Y 或左 grip）
-   - **B+Y**：进入 / 退出「上半身冻结规划」
-   - **A+B+X+Y**：急停并退出策略
-3. **双手开合**（Brainco，PICO；manager 启动后即可用，不必先 A+B+X+Y）：
-   - **左 trigger**：左手开合（松开=张开，按下=闭合）
-   - **右 trigger**：右手开合
-   - 终端应周期性打印 `[Brainco] trigger L=.. R=..`；若有打印但手不动，查机器人 `brainco_hand` / DDS 网卡
-4. **录制 episode**（PICO）：
-   - **left grip + A**：开始 / 停止录制
-   - **left grip + B**：丢弃当前 episode（仍会落盘，并在 `meta/info.json` 的 `discarded_episode_indices` 中标记）
-5. **数据保存路径**（默认）：
-   ```
-   /<root-output-dir>/<task_name>/<YYYY-MM-DD>/
-   ├── data/chunk-000/episode_XXXXXX.parquet
-   ├── videos/.../observation.images.ego_view_left/
-   ├── videos/.../observation.images.ego_view_right/
-   └── meta/{info.json, modality.json, episodes.jsonl, tasks.jsonl}
-   ```
+    - **A+X**：遥操（POSE）↔ 规划（PLANNER）
+    - **Y**：遥操暂停 ↔ 恢复遥操
+    - **A+B+X+Y**：急停并退出策略
+3. **规划模式移动**（进入 PLANNER 后）：
+    - 默认即锁定 **SLOW_WALK（慢走）**：左摇杆可直接平移，右摇杆左右控制朝向
+    - 松杆时下发 IDLE，机器人站定
+4. **双手开合**（Brainco，PICO；manager 启动后即可用）：
+    - **左 trigger**：左手开合
+    - **右 trigger**：右手开合
+    - 终端应周期性打印 `[Brainco] trigger L=.. R=..`；若有打印但手不动，查机器人 `brainco_hand` / DDS 网卡
+5. **录制 episode**（PICO）：
+    - **left grip + A**：开始 / 停止录制
+    - **left grip + B**：丢弃当前 episode（仍会落盘，并在 `meta/info.json` 的 `discarded_episode_indices` 中标记）
+6. **数据保存路径**（默认）：
 
+    ```text
+    /<root-output-dir>/<task_name>/<YYYY-MM-DD>/
+    ├── data/chunk-000/episode_XXXXXX.parquet
+    ├── videos/.../observation.images.ego_view_left/
+    ├── videos/.../observation.images.ego_view_right/
+    └── meta/{info.json, modality.json, episodes.jsonl, tasks.jsonl}
+    ```
 
-## Data Post-processing
+## 数据后处理
 
 采数完成后，按以下顺序做后处理（均在 **Psi0 仓库根目录** 执行）：
 
 ```text
 原始 SONIC LeRobot 数据集
-  → ① 清洗（剔除 discarded / stale SMPL 帧）
+  → ① 清洗（剔除 discarded episode；可选剔除无效 SMPL 帧）
   → ② 转换为 Ψ₀ LeRobot 格式
   → ③ 重新计算 stats
   → ④ 准备 stats_psi0.json → 可开始微调
 ```
 
-### 0. 设置路径变量
+### 1. 清洗原始数据集
 
-根据实际采数路径修改：
+`process_dataset.py` **不会删掉** `teleop.smpl_*` 等字段，也不会改 `modality.json` / feature schema。它只做：
 
-```bash
-export PSI_HOME=/home/karthus_chen/ycb_ws/Psi0   # 或你的 Psi0 根目录
-export TASK_NAME=test                             # 与 --task-name 一致
-export DATASET_DATE=2026-07-22                    # 采数当天日期 YYYY-MM-DD
+1. 按 `meta/info.json` 的 `discarded_episode_indices` **整段删除** discarded episode（parquet + 视频），并去掉该字段
+2. （默认开启）删除 **无效帧**：`teleop.smpl_pose` 全零的 stale 帧，及其前的冻结前导帧；有效帧上的 SMPL 原样保留
 
-export RAW_DATASET=/home/karthus_chen/ycb_ws/datasets/SONIC/$TASK_NAME/$DATASET_DATE
-export CLEAN_DATASET=/home/karthus_chen/ycb_ws/datasets/SONIC/$TASK_NAME/${DATASET_DATE}_cleaned
-```
-
-### 1. 清洗原始数据集（推荐）
-
-`process_dataset.py` 会：
-- 删除采集时按 **left grip + B** 标记的 discarded episode（`discarded_episode_indices`）
-- 删除 stale SMPL 帧（全零 `teleop.smpl_pose` 及之前的冻结前导帧）
+务必传 `--output-path`，否则会 **覆盖** 原始目录。
 
 ```bash
-cd $PSI_HOME/third_party/GR00T-WholeBodyControl
+cd /home/karthus_chen/ycb_ws/Psi0/third_party/GR00T-WholeBodyControl
 source .venv_data_collection/bin/activate
 
 python gear_sonic/scripts/process_dataset.py \
-    --dataset-path $RAW_DATASET \
-    --output-path $CLEAN_DATASET
+    --dataset-path /home/karthus_chen/ycb_ws/datasets/SONIC/test/2026-07-22/origin \
+    --output-path /home/karthus_chen/ycb_ws/datasets/SONIC/test/2026-07-22/clean \
+    --remove-discarded \
+    --remove-stale-smpl
 ```
 
-可选参数：
-| 参数 | 默认 | 说明 |
-|------|------|------|
-| `--remove-discarded` | `True` | 剔除 discarded episode |
-| `--no-remove-discarded` | — | 保留 discarded episode |
-| `--remove-stale-smpl` | `True` | 剔除 stale SMPL 帧 |
-| `--no-remove-stale-smpl` | — | 仅合并/整理，不做 SMPL 清洗 |
+详细处理逻辑与全部参数说明见 [`process_dataset.py`](third_party/GR00T-WholeBodyControl/gear_sonic/scripts/process_dataset.py)。
 
-> **注意**：此步骤会更新 `parquet` / `video` / `info.json` / `episodes.jsonl`，但**不会**重算 LeRobot 的 `meta/stats.json`。训练用 stats 在步骤 ③ 中重新计算。
-
-若跳过此步直接转换，`raw_sonic_to_psi_lerobot.py` **不会**读取 `discarded_episode_indices`，被 discard 的 episode 可能进入训练集。
 
 ### 2. 转换为 Ψ₀ LeRobot 格式
 
 ```bash
-cd $PSI_HOME
+cd /home/karthus_chen/ycb_ws/Psi0/
+source .venv-psi/bin/activate
 
+# 单目：ego_view → egocentric
 python scripts/data/raw_sonic_to_psi_lerobot.py \
-    --data-root=$CLEAN_DATASET \
-    --work-dir=$PSI_HOME/data/sonic/lerobot \
-    --repo-id=$TASK_NAME \
-    --robot-type=g1
+    --data-root=/home/karthus_chen/ycb_ws/datasets/SONIC/test/2026-07-22/clean \
+    --work-dir=/home/karthus_chen/ycb_ws/datasets/SONIC/test/2026-07-22/ \
+    --repo-id=lerobot_v2.1 \
+    --robot-type=g1 \
+    --use-mono-camera \
+    --eef brainco
+
+# 双目：ego_view_left/right → egocentric_left/right
+python scripts/data/raw_sonic_to_psi_lerobot.py \
+    --data-root=/home/karthus_chen/ycb_ws/datasets/SONIC/test/2026-07-22/clean \
+    --work-dir=/home/karthus_chen/ycb_ws/datasets/SONIC/test/2026-07-22/ \
+    --repo-id=lerobot_v2.1 \
+    --robot-type=g1 \
+    --use-stereo-camera \
+    --eef brainco
 ```
-
-输出目录：`$PSI_HOME/data/sonic/lerobot/$TASK_NAME/`
-
-> **注意**：当前转换脚本期望单目视频 key `observation.images.ego_view`。若采数时使用了 `--record-stereo-ego`（`ego_view_left` / `ego_view_right`），需先改转换脚本或调整采数配置，否则会报找不到视频文件。
 
 ### 3. 重新计算 stats
 
 ```bash
 python scripts/data/calc_modality_stats.py \
-    --work-dir=$PSI_HOME/data/sonic/lerobot \
-    --task=$TASK_NAME
+    --work-dir=/home/karthus_chen/ycb_ws/datasets/SONIC/test/2026-07-22/ \
+    --task=lerobot_v2.1
 ```
 
 ### 4. 生成 Ψ₀ 训练用 stats 副本
@@ -203,27 +226,27 @@ bash ./scripts/train/psi0/finetune-real-sonic-psi0.sh $TASK_NAME
 
 更多训练/部署说明见 [Psi0 README — Ψ₀ with SONIC](README.md#psi0-sonic)。
 
-## Keyboard：Normal / Planner mode（deploy 终端）
+
+## 键盘：Normal / Planner 模式（deploy 终端）
 
 ```bash
 cd third_party/GR00T-WholeBodyControl/gear_sonic_deploy
 source scripts/setup_env.sh
-./deploy.sh --input-type keyboard real   # sim: ./deploy.sh --input-type keyboard sim
+./deploy.sh --input-type keyboard real   # 仿真：./deploy.sh --input-type keyboard sim
 ```
 
-| Key | Action |
+| 按键 | 作用 |
 | --- | --- |
 | `]` | 启动控制 |
 | `ENTER` | 切换 Normal ↔ Planner |
 | `O` | 急停并退出 |
 
-**Normal mode**（默认，参考动作回放）
-- `T`：播放当前动作；`R`：重置到第 0 帧
-- `N` / `P`：下一个 / 上一个动作序列
-- `Q` / `E`：航向微调
-
-**Planner mode**（`ENTER` 进入）
-- `W`/`S`：前进 / 后退；`A`/`D`：转向并前进；`,`/`.`：侧移
-- `Q`/`E`：原地转向；`9`/`0`：减速 / 加速；`-`/`=`：蹲姿高度
-- `N`/`P`：切换 motion set；`1`–`8`：选择 style
-- `R` / backtick / `~`：立即清零动量急停
+1. **Normal 模式**（默认，参考动作回放）
+    - `T`：播放当前动作；`R`：重置到第 0 帧
+    - `N` / `P`：下一个 / 上一个动作序列
+    - `Q` / `E`：航向微调
+2. **Planner 模式**（`ENTER` 进入）
+    - `W`/`S`：前进 / 后退；`A`/`D`：转向并前进；`,`/`.`：侧移
+    - `Q`/`E`：原地转向；`9`/`0`：减速 / 加速；`-`/`=`：蹲姿高度
+    - `N`/`P`：切换 motion set；`1`–`8`：选择 style
+    - `R` / backtick / `~`：立即清零动量急停

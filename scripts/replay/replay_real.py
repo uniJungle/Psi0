@@ -14,24 +14,29 @@ Usage:
     # Or if C++ WBC is running with deploy_psi0-sonic-rtc-robot.sh (input-type=manager):
     python replay_real.py --mode token --episode_idx 0 --robot_ip 192.168.123.164 --input_type manager
 
-Architecture:
-    [LeRobot Dataset]  -->  [replay_real.py]  -->  [ZMQ PUB:5556]
-                                                          |
-    [Real Robot + C++ WBC]  <--  [ZMQ SUB:5557]  <--------+
-         (listens on ZMQ PUB:5556)
+Architecture (same host as C++ --zmq-host, usually the workstation):
+    [LeRobot Dataset] --> [replay_real.py] --bind--> tcp://*:5556 (PUB)
+                                                         ^
+                                                         | connect (SUB)
+                                              [C++ WBC --zmq-host localhost]
+                                                         |
+                                              DDS / Unitree --> real robot
 
 ZMQ Protocol:
     - planner mode: "planner" topic with upper_body_position (arm joints 14D)
     - token mode:   "pose" topic with token_state (64D motion token) + hand joints (14D)
     - command:      "command" topic (start/stop/planner mode)
 
-Input Types:
-    - zmq_manager: Used by collect_psi0-sonic-data-manual.sh deploy (streaming motion mode)
-    - manager:     Used by deploy_psi0-sonic-rtc-robot.sh (needs explicit start/stop)
+Input Types (must match C++ --input-type):
+    - zmq_manager: collect_psi0-sonic-data-manual.sh deploy  (receives command+pose)
+    - manager:     deploy_psi0-sonic-rtc-robot.sh InterfaceManager
+                   (starts in KEYBOARD; press Shift+3 for ZMQ, may need ENTER to
+                    enable ZMQ stream — prefer zmq_manager for token replay)
 """
 
 from __future__ import annotations
 
+import json
 import os
 import sys
 import time
@@ -42,6 +47,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 import numpy as np
+import pandas as pd
 
 # Add third_party/GR00T-WholeBodyControl to path for imports
 _THIRD_PARTY = Path(__file__).parent.parent.parent / "third_party" / "GR00T-WholeBodyControl"
@@ -71,30 +77,27 @@ def fsq_quantize(continuous_value, fsq_min=FSQ_MIN, fsq_max=FSQ_MAX, fsq_step=FS
 # ---------------- Action Extraction ----------------
 
 
+def _as_1d(value: Any, fallback: np.ndarray) -> np.ndarray:
+    if value is None:
+        return fallback.copy()
+    arr = np.asarray(value, dtype=np.float64)
+    if arr.ndim > 1:
+        arr = arr.reshape(-1)
+    return arr
+
+
 def extract_action_token(frame: dict[str, Any]) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Extract motion token and hand joints from a dataset frame."""
-    # motion_token: (64D) action.motion_token
-    motion_token = frame.get("action.motion_token", np.zeros(64))
-    if motion_token.ndim > 1:
-        motion_token = motion_token[0]
-
-    # hand joints: (7D) teleop.left_hand_joints + (7D) teleop.right_hand_joints
-    left_hand = frame.get("teleop.left_hand_joints", np.zeros(7))
-    right_hand = frame.get("teleop.right_hand_joints", np.zeros(7))
-    if left_hand.ndim > 1:
-        left_hand = left_hand[0]
-    if right_hand.ndim > 1:
-        right_hand = right_hand[0]
-
+    motion_token = _as_1d(frame.get("action.motion_token"), np.zeros(64))
+    left_hand = _as_1d(frame.get("teleop.left_hand_joints"), np.zeros(7))
+    right_hand = _as_1d(frame.get("teleop.right_hand_joints"), np.zeros(7))
     return motion_token, left_hand, right_hand
 
 
 def extract_action_joints(frame: dict[str, Any]) -> dict[str, np.ndarray]:
     """Extract joint values from a dataset frame (for planner mode)."""
     # observation.state contains all joint positions (43D)
-    state = frame.get("observation.state", np.zeros(43))
-    if state.ndim > 1:
-        state = state[0]
+    state = _as_1d(frame.get("observation.state"), np.zeros(43))
 
     # Split into body parts
     action = {
@@ -133,6 +136,46 @@ def action_to_planner_fields(action: dict[str, np.ndarray]) -> dict[str, np.ndar
     }
 
 
+def resolve_episode_parquet(data_dir: str | Path, episode_idx: int) -> Path:
+    """Resolve parquet path for episode_idx from local LeRobot meta/info.json."""
+    data_path = Path(data_dir)
+    info_path = data_path / "meta" / "info.json"
+    if not info_path.is_file():
+        raise FileNotFoundError(f"info.json not found: {info_path}")
+
+    with open(info_path, "r", encoding="utf-8") as f:
+        info = json.load(f)
+
+    total = int(info.get("total_episodes", 0))
+    if episode_idx < 0 or (total > 0 and episode_idx >= total):
+        raise ValueError(f"Episode index {episode_idx} out of range, available: 0-{max(total - 1, 0)}")
+
+    chunks_size = int(info.get("chunks_size", 1000))
+    chunk_idx = episode_idx // chunks_size
+    data_tpl = info.get(
+        "data_path",
+        "data/chunk-{episode_chunk:03d}/episode_{episode_index:06d}.parquet",
+    )
+    parquet_path = data_path / data_tpl.format(
+        episode_chunk=chunk_idx,
+        episode_index=episode_idx,
+    )
+    if not parquet_path.is_file():
+        raise FileNotFoundError(f"Episode parquet not found: {parquet_path}")
+    return parquet_path
+
+
+def row_to_frame(row: pd.Series) -> dict[str, Any]:
+    """Convert a parquet row to a plain dict of numpy arrays."""
+    frame: dict[str, Any] = {}
+    for key, value in row.items():
+        if isinstance(value, (list, tuple, np.ndarray)):
+            frame[key] = np.asarray(value)
+        else:
+            frame[key] = value
+    return frame
+
+
 # ---------------- ZMQ Client ----------------
 
 
@@ -166,39 +209,32 @@ class ReplayZMQClient:
         self._frame_index = 0
 
     def connect(self):
-        """Connect to ZMQ publisher."""
+        """Bind ZMQ PUB so C++ zmq_manager / InterfaceManager can SUB-connect.
+
+        SONIC C++ side does ``socket.connect(tcp://{zmq_host}:{port})`` (default
+        ``localhost:5556``). Publishers (pico_manager, psi_rtc_sonic_client,
+        test_zmq_manager) therefore must ``bind``. Connecting as PUB to the
+        robot IP is wrong and messages are silently dropped.
+        """
         self.ctx = zmq.Context()
         self.sock = self.ctx.socket(zmq.PUB)
-        endpoint = f"tcp://{self.host}:{self.port}"
-        self.sock.connect(endpoint)
+        # host="*" or empty -> bind all interfaces; else bind specific address
+        bind_host = self.host if self.host not in ("localhost", "127.0.0.1") else "*"
+        if bind_host in ("", "auto"):
+            bind_host = "*"
+        endpoint = f"tcp://{bind_host}:{self.port}"
+        self.sock.bind(endpoint)
 
-        # Give subscriber time to connect
-        time.sleep(0.5)
+        # Give C++ SUB time to (re)connect after bind
+        time.sleep(1.0)
         if self.verbose:
-            print(f"[ReplayZMQ] Connected to {endpoint}, mode={self.mode}, input_type={self.input_type}")
+            print(f"[ReplayZMQ] Bound PUB at {endpoint}, mode={self.mode}, input_type={self.input_type}")
+            print("[ReplayZMQ] Ensure C++ deploy --zmq-host points at this machine (default: localhost)")
 
     def send_command(self, start: bool = False, stop: bool = False, planner: bool = True):
-        """Send command message to switch modes."""
-        topic = b"command"
-        fields = [
-            {"name": "start", "dtype": "u8", "shape": [1]},
-            {"name": "stop", "dtype": "u8", "shape": [1]},
-            {"name": "planner", "dtype": "u8", "shape": [1]},
-        ]
-
-        header = {"v": 1, "endian": "le", "count": 1, "fields": fields}
-        header_json = json.dumps(header).encode("utf-8")
-        HEADER_SIZE = 1280
-        header_bytes = header_json + b"\x00" * (HEADER_SIZE - len(header_json))
-
-        data = b""
-        data += struct.pack("B", 1 if start else 0)
-        data += struct.pack("B", 1 if stop else 0)
-        data += struct.pack("B", 1 if planner else 0)
-
-        message = topic + header_bytes + data
-        self.sock.send(message)
-
+        """Send command message (same wire format as pico_manager / replay_sim)."""
+        msg = build_command_message(start=start, stop=stop, planner=planner)
+        self.sock.send(msg)
         if self.verbose:
             print(f"[ReplayZMQ] Command: start={start}, stop={stop}, planner={planner}")
 
@@ -292,50 +328,22 @@ class ReplayReal:
         self.warmup_seconds = warmup_seconds
         self.running = True
 
-        # Load dataset (local only, no HuggingFace)
-        from psi.data.lerobot.compat import LeRobotDataset
+        # Read selected episode parquet directly (no LeRobotDataset / video preload)
+        self.parquet_path = resolve_episode_parquet(data_dir, episode_idx)
+        self.df = pd.read_parquet(self.parquet_path)
+        self.num_frames = len(self.df)
+        if self.num_frames == 0:
+            raise ValueError(f"Empty episode parquet: {self.parquet_path}")
+        print(
+            f"[ReplayReal] Loaded parquet: {self.parquet_path} "
+            f"(episode={episode_idx}, frames={self.num_frames})"
+        )
 
-        data_path = Path(data_dir)
-        repo_id = data_path.name
-        root = str(data_path)
-        self.full_dataset = LeRobotDataset(repo_id=repo_id, root=root)
-        print(f"[ReplayReal] Loaded dataset: repo_id={repo_id}, root={root}, episodes={self.full_dataset.num_episodes}, total_frames={len(self.full_dataset)}")
-
-        # Select specific episode
-        episode_index = self.full_dataset.episode_data_index
-        num_episodes = self.full_dataset.num_episodes
-
-        if episode_idx >= num_episodes:
-            raise ValueError(f"Episode index {episode_idx} out of range, available: 0-{num_episodes-1}")
-
-        start_idx = episode_index["from"][episode_idx].item()
-        end_idx = episode_index["to"][episode_idx].item()
-        self.episode_indices = list(range(start_idx, end_idx))
-        print(f"[ReplayReal] Selected episode {self.episode_idx}: frames {start_idx}-{end_idx-1} ({len(self.episode_indices)} frames)")
-
-        # Preload all frames into memory
-        print(f"[ReplayReal] Preloading {len(self.episode_indices)} frames into memory...")
-        preload_start = time.perf_counter()
-        self.frames = []
-        for idx in self.episode_indices:
-            frame = self.full_dataset[idx]
-            frame_data = {}
-            for key, value in frame.items():
-                if hasattr(value, 'numpy'):
-                    frame_data[key] = value.numpy()
-                else:
-                    frame_data[key] = np.asarray(value)
-            self.frames.append(frame_data)
-        preload_time = time.perf_counter() - preload_start
-        print(f"[ReplayReal] Preloading done in {preload_time:.2f}s ({preload_time/len(self.frames)*1000:.1f}ms per frame)")
-
-        # ZMQ client
-        # Note: For real robot, the C++ WBC runs on the robot and listens on a port.
-        # The replay script runs on the workstation and connects as a publisher.
-        # Use localhost if running on the same machine, or robot's IP otherwise.
-        zmq_host = robot_ip if robot_ip != "localhost" else "localhost"
+        # ZMQ PUB must bind on the same host that C++ --zmq-host connects to.
+        # Default deploy uses --zmq-host localhost, so bind *:5556 on this machine.
+        # (robot_ip is kept for API compatibility; ZMQ does not target the robot NIC.)
         self.zmq = ReplayZMQClient(
-            host=zmq_host,
+            host="*",
             port=zmq_port,
             mode=mode,
             input_type=input_type,
@@ -354,34 +362,31 @@ class ReplayReal:
         """Run the replay."""
         print(f"[ReplayReal] Starting replay at {self.fps} Hz, mode={self.mode}, input_type={self.input_type}")
 
-        # Determine planner mode flag
-        if self.mode == "token":
-            planner_mode = False  # streamed motion mode expects pose topic
-        else:
-            planner_mode = True   # planner mode expects planner topic
+        # ZMQManager only processes `start` while in PLANNER mode. Sending
+        # start=True with planner=False immediately jumps to STREAMED_MOTION and
+        # drops the start handshake → C++ stays in WAIT_FOR_CONTROL (tokens
+        # arrive/log but motors never engage). Match pico_manager / RTC client:
+        #   1) start + planner=True  → enter CONTROL
+        #   2) start + planner=False → STREAMED_MOTION (token / pose topic)
+        #   3) stream pose frames
+        print("[ReplayReal] Step 1/2: start control in PLANNER mode...")
+        self.zmq.send_command(start=True, stop=False, planner=True)
+        time.sleep(max(self.warmup_seconds, 2.0))
 
-        # Send start command
-        # For zmq_manager: C++ WBC auto-starts when it receives pose messages
-        # For manager: need explicit start command
-        if self.input_type == "manager":
-            self.zmq.send_command(start=True, stop=False, planner=planner_mode)
-            print(f"[ReplayReal] Waiting {self.warmup_seconds}s for warmup...")
-            time.sleep(self.warmup_seconds)
+        if self.mode == "token":
+            print("[ReplayReal] Step 2/2: switch to STREAMED_MOTION (pose/token)...")
+            self.zmq.send_command(start=True, stop=False, planner=False)
+            time.sleep(1.0)
+            planner_mode = False
+        else:
+            planner_mode = True
 
         frame_idx = 0
         prev_time = time.perf_counter()
-        started = False
 
-        while self.running and frame_idx < len(self.frames):
-            frame = self.frames[frame_idx]
+        while self.running and frame_idx < self.num_frames:
+            frame = row_to_frame(self.df.iloc[frame_idx])
 
-            # For zmq_manager mode, first pose triggers start
-            if self.input_type == "zmq_manager" and not started:
-                self.zmq.send_command(start=True, stop=False, planner=planner_mode)
-                started = True
-                print(f"[ReplayReal] Sent start command, beginning replay...")
-
-            # Send based on mode
             if self.mode == "token":
                 motion_token, left_hand, right_hand = extract_action_token(frame)
                 self.zmq.send_token(motion_token, left_hand, right_hand)
@@ -389,11 +394,9 @@ class ReplayReal:
                 action = extract_action_joints(frame)
                 self.zmq.send_action(action)
 
-            # Progress logging
             if frame_idx % 30 == 0:
-                print(f"[ReplayReal] Frame {frame_idx}/{len(self.frames)}")
+                print(f"[ReplayReal] Frame {frame_idx}/{self.num_frames}")
 
-            # Frame timing
             elapsed = time.perf_counter() - prev_time
             sleep_time = self.frame_duration - elapsed
             if sleep_time > 0:
@@ -401,13 +404,9 @@ class ReplayReal:
             prev_time = time.perf_counter()
             frame_idx += 1
 
-        # Replay finished
         print("[ReplayReal] Replay finished")
-
-        # For manager mode, send stop command
-        if self.input_type == "manager":
-            print("[ReplayReal] Sending stop command...")
-            self.zmq.send_command(start=False, stop=True, planner=planner_mode)
+        print("[ReplayReal] Sending stop command...")
+        self.zmq.send_command(start=False, stop=True, planner=planner_mode)
 
         print("[ReplayReal] Waiting, press Ctrl+C to exit")
         while self.running:
@@ -435,7 +434,7 @@ Examples:
     parser.add_argument(
         "--data_dir",
         type=str,
-        default="/home/zzz/unitree_sh_disk/tools/ycb/datasets/SONIC/test/2026-07-22/origin",
+        default="/home/karthus_chen/ycb_ws/datasets/SONIC/test/2026-07-22/origin",
         help="Path to LeRobot dataset directory",
     )
     parser.add_argument(
@@ -454,7 +453,7 @@ Examples:
         "--robot_ip",
         type=str,
         default="192.168.123.164",
-        help="Robot IP address (default: 192.168.123.164)",
+        help="Unused for ZMQ (kept for compatibility). C++ must use --zmq-host localhost.",
     )
     parser.add_argument(
         "--zmq_port",

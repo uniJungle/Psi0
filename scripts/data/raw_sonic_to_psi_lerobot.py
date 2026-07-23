@@ -28,6 +28,13 @@ logging.getLogger("datasets").setLevel(logging.ERROR)
 
 # --- source (collection) column names ---
 SRC_VIDEO_KEY = "observation.images.ego_view"
+SRC_VIDEO_KEY_LEFT = "observation.images.ego_view_left"
+SRC_VIDEO_KEY_RIGHT = "observation.images.ego_view_right"
+# --- Psi0 output video keys ---
+DST_VIDEO_KEY = "observation.images.egocentric"
+DST_VIDEO_KEY_LEFT = "observation.images.egocentric_left"
+DST_VIDEO_KEY_RIGHT = "observation.images.egocentric_right"
+
 SRC_STATE = "observation.state"            # 43, joint-angle layout below
 SRC_ACTION_WBC = "action.wbc"              # 43, same layout as state
 SRC_MOTION_TOKEN = "action.motion_token"   # 64
@@ -38,6 +45,12 @@ SRC_MOTION_TOKEN = "action.motion_token"   # 64
 # Psi0 puts hands last: qpos(29)=lower+larm+rarm, hand(14)=lhand+rhand.
 QPOS_SLICES = [(0, 15), (15, 22), (29, 36)]   # -> 29
 HAND_SLICES = [(22, 29), (36, 43)]            # -> 14
+
+# Psi0 output dims: states = qpos(29)+hand(14 or 4), action = motion_token(64)+hand(14 or 4)
+# We will determine STATE_DIM and ACTION_DIM dynamically based on the input hand dimension.
+
+# (source video key, destination video key)
+VideoKeyPair = Tuple[str, str]
 
 
 @dataclass
@@ -85,17 +98,38 @@ class Sonic2LeRobotConverter:
     """Convert a SONIC deploy-collected LeRobot dataset into the Psi0 training format.
 
     Source has the GR00T-WholeBodyControl schema (observation.state[43],
-    action.wbc[43], action.motion_token[64], teleop.* columns) with a single
-    video key ``observation.images.ego_view``. Output matches multi_task_psi0_sonic:
-    states[43]=qpos(29)+hand(14), action[78]=motion_token(64)+hand(14), one
-    ``observation.images.egocentric`` video. Frames are kept 1:1; video is copied.
+    action.wbc[43], action.motion_token[64], teleop.* columns).
+
+    Mono (``--use-mono-camera``): source ``observation.images.ego_view`` →
+    ``observation.images.egocentric``.
+
+    Stereo (``--use-stereo-camera``): source
+    ``ego_view_left`` / ``ego_view_right`` →
+    ``egocentric_left`` / ``egocentric_right``.
+
+    Output matches multi_task_psi0_sonic numeric layout:
+    states[43]=qpos(29)+hand(14), action[78]=motion_token(64)+hand(14).
+    Frames are kept 1:1; video is copied.
     """
 
-    def __init__(self):
+    def __init__(self, use_stereo_camera: bool = False, hand_dim: int = 7):
+        self.use_stereo_camera = use_stereo_camera
+        self.hand_dim = hand_dim
+        self.state_dim = 29 + self.hand_dim * 2
+        self.action_dim = 64 + self.hand_dim * 2
+
+        if use_stereo_camera:
+            self.video_key_pairs: List[VideoKeyPair] = [
+                (SRC_VIDEO_KEY_LEFT, DST_VIDEO_KEY_LEFT),
+                (SRC_VIDEO_KEY_RIGHT, DST_VIDEO_KEY_RIGHT),
+            ]
+        else:
+            self.video_key_pairs = [(SRC_VIDEO_KEY, DST_VIDEO_KEY)]
+
         self.features = Features(
             {
-                "states": Sequence(Value("float32")),
-                "action": Sequence(Value("float32")),
+                "states": Sequence(Value("float32"), length=self.state_dim),
+                "action": Sequence(Value("float32"), length=self.action_dim),
                 "timestamp": Value("float32"),
                 "frame_index": Value("int64"),
                 "episode_index": Value("int64"),
@@ -105,24 +139,34 @@ class Sonic2LeRobotConverter:
             }
         )
         self.tasks_meta: Dict[int, str] = {}                  # task_index -> description
-        self.episode_sources: List[Tuple[int, Path, Path, int]] = []  # (task_idx, parquet, video, out_ep)
+        # (task_idx, parquet, {dst_key: src_video_path}, out_ep)
+        self.episode_sources: List[Tuple[int, Path, Dict[str, Path], int]] = []
         self.lengths_by_episode: Dict[int, int] = {}
         self.chunks_size: int = 1000
+        self.num_episodes: int = 0
+        self.total_frames: int = 0
 
-    def build_obs(self, state43: np.ndarray) -> Dict[str, Any]:
-        states = np.concatenate([take_slices(state43, QPOS_SLICES), take_slices(state43, HAND_SLICES)])
-        return {"states": states.astype(np.float32).tolist()}  # 29 + 14 = 43
+    def build_obs(self, state_wbc: np.ndarray) -> Dict[str, Any]:
+        # state_wbc is either 43-dim (dex3) or 33-dim (brainco)
+        # qpos is the first 29 dims, hand is the rest
+        qpos = take_slices(state_wbc, QPOS_SLICES)
+        hand = state_wbc[29:]
+        states = np.concatenate([qpos, hand])
+        return {"states": states.astype(np.float32).tolist()}
 
-    def build_act(self, token64: np.ndarray, wbc43: np.ndarray) -> List[float]:
-        action = np.concatenate([token64, take_slices(wbc43, HAND_SLICES)])
-        return action.astype(np.float32).tolist()  # 64 + 14 = 78
+    def build_act(self, token64: np.ndarray, wbc: np.ndarray) -> List[float]:
+        # wbc is either 43-dim (dex3) or 33-dim (brainco)
+        # hand is the rest after 29
+        hand = wbc[29:]
+        action = np.concatenate([token64, hand])
+        return action.astype(np.float32).tolist()
 
     def make_one_episode(
         self,
         task_index: int,
         episode_index: int,
         src_parquet: Path,
-        src_video: Path,
+        src_videos: Dict[str, Path],
         out_base: Path,
         chunks_size: int,
     ) -> Tuple[int, int]:
@@ -130,9 +174,13 @@ class Sonic2LeRobotConverter:
         chunk_path.mkdir(parents=True, exist_ok=True)
         parquet_path = chunk_path / f"episode_{episode_index:06d}.parquet"
 
-        ego_dir = out_base.parent / "videos" / f"chunk-{episode_index // chunks_size:03d}" / "observation.images.egocentric"
-        ego_dir.mkdir(parents=True, exist_ok=True)
-        vid_path = ego_dir / f"episode_{episode_index:06d}.mp4"
+        videos_chunk = out_base.parent / "videos" / f"chunk-{episode_index // chunks_size:03d}"
+        for dst_key, src_video in src_videos.items():
+            ego_dir = videos_chunk / dst_key
+            ego_dir.mkdir(parents=True, exist_ok=True)
+            vid_path = ego_dir / f"episode_{episode_index:06d}.mp4"
+            assert src_video.is_file(), f"missing source video: {src_video}"
+            shutil.copyfile(src_video, vid_path)  # already h264/yuv420p
 
         df = pd.read_parquet(src_parquet)
         n = len(df)
@@ -161,7 +209,6 @@ class Sonic2LeRobotConverter:
         parquet_tmp = tmp_dir / "episode.parquet"
         Dataset.from_list(rows, features=self.features).to_parquet(str(parquet_tmp))
         os.replace(parquet_tmp, parquet_path)
-        shutil.copyfile(src_video, vid_path)  # already h264/yuv420p
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
         # per-episode action/timestamp stats -> episodes_stats.jsonl
@@ -189,6 +236,9 @@ class Sonic2LeRobotConverter:
         data_dir = work_dir / "data"
         data_dir.mkdir(parents=True, exist_ok=True)
 
+        cam_mode = "stereo (left/right)" if self.use_stereo_camera else "mono (ego_view)"
+        print(f"Camera mode: {cam_mode}")
+
         # task string -> index, and episode -> task description, from the source meta
         task_to_idx: Dict[str, int] = {}
         for r in read_jsonl(data_root / "meta" / "tasks.jsonl"):
@@ -205,12 +255,15 @@ class Sonic2LeRobotConverter:
             src_ep = int(pq.stem.split("_")[1])
             desc = ep_task.get(src_ep, "")
             task_idx = task_to_idx.get(desc, 0)
-            video = (
-                data_root / "videos" / f"chunk-{src_ep // chunks_size:03d}"
-                / SRC_VIDEO_KEY / f"episode_{src_ep:06d}.mp4"
-            )
-            assert video.is_file(), f"missing source video: {video}"
-            self.episode_sources.append((task_idx, pq, video, out_ep))
+            chunk = f"chunk-{src_ep // chunks_size:03d}"
+            src_videos: Dict[str, Path] = {}
+            for src_key, dst_key in self.video_key_pairs:
+                video = (
+                    data_root / "videos" / chunk / src_key / f"episode_{src_ep:06d}.mp4"
+                )
+                assert video.is_file(), f"missing source video: {video}"
+                src_videos[dst_key] = video
+            self.episode_sources.append((task_idx, pq, src_videos, out_ep))
             out_ep += 1
 
         print(f"Found {len(self.episode_sources)} episodes, {len(self.tasks_meta)} tasks.")
@@ -220,8 +273,8 @@ class Sonic2LeRobotConverter:
 
         with ProcessPoolExecutor(max_workers=num_workers) as ex:
             futures = [
-                ex.submit(self.make_one_episode, task_idx, oi, pq, vid, data_dir, chunks_size)
-                for (task_idx, pq, vid, oi) in self.episode_sources
+                ex.submit(self.make_one_episode, task_idx, oi, pq, vids, data_dir, chunks_size)
+                for (task_idx, pq, vids, oi) in self.episode_sources
             ]
             for fut in tqdm(as_completed(futures), total=len(futures), desc="Processing episodes", unit="ep"):
                 ep_idx, n_frames = fut.result()
@@ -237,7 +290,7 @@ class Sonic2LeRobotConverter:
 
         dataset_cursor = 0
         ep_rows_meta = []
-        for (task_idx, _pq, _vid, ep_index) in sorted(self.episode_sources, key=lambda x: x[3]):
+        for (task_idx, _pq, _vids, ep_index) in sorted(self.episode_sources, key=lambda x: x[3]):
             n = self.lengths_by_episode.get(ep_index, 0)
             if n <= 0:
                 continue
@@ -265,28 +318,34 @@ class Sonic2LeRobotConverter:
             "video.fps": float(FPS), "video.codec": "h264", "video.pix_fmt": "yuv420p",
             "video.is_depth_map": False, "has_audio": False,
         }
-        features_meta = {
-            "observation.images.egocentric": {
-                "dtype": "video", "shape": [480, 640, 3],
-                "names": ["height", "width", "channel"], "video_info": video_info,
-            },
-            "states": {"dtype": "float32", "shape": [-1]},
-            "action": {"dtype": "float32", "shape": [-1]},
-            "timestamp": {"dtype": "float32", "shape": [1]},
-            "frame_index": {"dtype": "int64", "shape": [1]},
-            "episode_index": {"dtype": "int64", "shape": [1]},
-            "index": {"dtype": "int64", "shape": [1]},
-            "next.done": {"dtype": "bool", "shape": [1]},
-            "task_index": {"dtype": "int64", "shape": [1]},
+        video_feature = {
+            "dtype": "video", "shape": [480, 640, 3],
+            "names": ["height", "width", "channel"], "video_info": video_info,
         }
+        features_meta: Dict[str, Any] = {
+            dst_key: dict(video_feature) for _, dst_key in self.video_key_pairs
+        }
+        features_meta.update(
+            {
+                "states": {"dtype": "float32", "shape": [self.state_dim]},
+                "action": {"dtype": "float32", "shape": [self.action_dim]},
+                "timestamp": {"dtype": "float32", "shape": [1]},
+                "frame_index": {"dtype": "int64", "shape": [1]},
+                "episode_index": {"dtype": "int64", "shape": [1]},
+                "index": {"dtype": "int64", "shape": [1]},
+                "next.done": {"dtype": "bool", "shape": [1]},
+                "task_index": {"dtype": "int64", "shape": [1]},
+            }
+        )
 
+        n_video_keys = len(self.video_key_pairs)
         info = InfoDict(
             codebase_version=CODE_VERSION,
             robot_type="g1",
             total_episodes=self.num_episodes,
             total_frames=self.total_frames,
             total_tasks=len(self.tasks_meta),
-            total_videos=self.num_episodes,
+            total_videos=self.num_episodes * n_video_keys,
             total_chunks=math.ceil(self.num_episodes / self.chunks_size),
             chunks_size=self.chunks_size,
             fps=FPS,
@@ -318,6 +377,25 @@ def main():
     parser.add_argument("--repo-exist-ok", action="store_true")
     parser.add_argument("--num-workers", type=int, default=os.cpu_count(), help="Max parallel workers")
     parser.add_argument("--robot-type", type=str, choices=["g1"], default="g1")
+    parser.add_argument("--eef", type=str, choices=["dex3", "brainco"], default="dex3",
+                        help="End-effector type used during collection. Determines hand dimension (dex3=7, brainco=2).")
+    cam_group = parser.add_mutually_exclusive_group(required=True)
+    cam_group.add_argument(
+        "--use-stereo-camera",
+        action="store_true",
+        help=(
+            "Stereo: read observation.images.ego_view_left/right and write "
+            "egocentric_left/right."
+        ),
+    )
+    cam_group.add_argument(
+        "--use-mono-camera",
+        action="store_true",
+        help=(
+            "Mono (Psi0 original): read observation.images.ego_view and write "
+            "egocentric."
+        ),
+    )
     args = parser.parse_args()
 
     data_root = Path(args.data_root).expanduser().resolve()
@@ -327,7 +405,8 @@ def main():
     for d in [work_dir / "data", work_dir / "videos", work_dir / "meta"]:
         d.mkdir(parents=True, exist_ok=True)
 
-    pipeline = Sonic2LeRobotConverter()
+    hand_dim = 2 if args.eef == "brainco" else 7
+    pipeline = Sonic2LeRobotConverter(use_stereo_camera=args.use_stereo_camera, hand_dim=hand_dim)
     pipeline.run(data_root, work_dir, args.chunks_size, args.num_workers, args.robot_type)
     pipeline.write_meta(work_dir)
 

@@ -452,20 +452,30 @@ python scripts/replay/replay_sim.py --mode token --episode_idx 0
 一切正常，只不过需要预加载数据集到内存中，这个可能是因为要过一层NAS，所以比较慢。
 
 ### 真机回放
+
+推荐用采数同款控制器（`--input-type zmq_manager`）。回放脚本会 **PUB bind** `tcp://*:5556`，C++ 默认 `--zmq-host localhost` SUB connect；两端都在工作站跑。
+
 ```bash
-# 方式 1: 用采数时的控制器 (collect_psi0-sonic-data-manual.sh)
-# 先在机器人上启动：
+# 1) 工作站：只启动一个 deploy（关掉其它占用 5556 / DDS 的旧进程）
 bash ./real/SONIC/scripts/collect_psi0-sonic-data-manual.sh deploy
+# 等到 Init Done / [ZMQManager] Host: localhost:5556
 
-# 再在工作站上回放：
-python scripts/replay/replay_real.py --mode token --episode_idx 0 --input_type zmq_manager
-
-# 方式 2: 用真机推理部署的控制器 (deploy_psi0-sonic-rtc-robot.sh)
-# 先在机器人上启动：
-bash ./real/scripts/deploy_psi0-sonic-rtc-robot.sh
-# 当看到 "Init done." 时，可以按 **]** 按钮让机器人站立。之后按 **ENTER** 键开始部署策略。部署完成后，再次按 **ENTER** 键停止策略并让机器人恢复默认姿态。
-
-# 再在工作站上回放：
-python scripts/replay/replay_real.py --mode token --episode_idx 0 --input_type manager
+# 2) 工作站：token 回放（先 planner=True 进 CONTROL，再切 STREAMED_MOTION）
+python scripts/replay/replay_real.py \
+  --mode token \
+  --episode_idx 0 \
+  --input_type zmq_manager \
+  --data_dir /home/karthus_chen/ycb_ws/datasets/SONIC/test/2026-07-23/
 ```
+
+成功时 deploy 端应依次出现：
+- `[ZMQManager] Planner enabled` / `motion name is planner_motion`
+- `[Control] ... transitioning to CONTROL state`
+- `[ZMQManager] Switched to: STREAMED MOTION` / `ZMQ STREAMING MODE: ENABLED`
+- `[ZMQEndpointInterface] Protocol v4: Received 64D token ...`
+
+注意：
+- 不要用 `deploy_psi0-sonic-rtc-robot.sh`（默认 `input-type=manager` / InterfaceManager，默认 KEYBOARD）做 token 回放。
+- 不要边开 pico 边回放（pico 也会 bind 5556，端口冲突）。
+- 若只看到 token 日志但机器人不动，多半是 `start` 握手失败（必须先 `planner=True` 再切 streamed）；当前 `replay_real.py` 已按该顺序发送。
 
