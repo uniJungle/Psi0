@@ -2,3 +2,6 @@
 	path = third_party/SIMPLE
 	url = git@github.com:physical-superintelligence-lab/SIMPLE.git
 	branch = main
+[submodule "third_party/GR00T-WholeBodyControl"]
+	path = third_party/GR00T-WholeBodyControl
+	url = https://github.com/uniJungle/GR00T-WholeBodyControl.git
