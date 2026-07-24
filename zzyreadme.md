@@ -453,20 +453,53 @@ python scripts/replay/replay_sim.py --mode token --episode_idx 0
 
 ### 真机回放
 
+ZMQManager 有两种工作模式：
+├── PLANNER 模式 (ManagedMode::PLANNER)
+│   └── 接收 planner 主题的 locomotion 命令（步行、站立等）
+│
+└── STREAMED_MOTION 模式 (ManagedMode::STREAMED_MOTION)
+    └── 接收 pose 主题的流式动作数据（遥操/回放）
+    
+deploy --input-type zmq_manager
+         │
+         ▼
+    ┌─────────────┐
+    │ ZMQManager │
+    └─────────────┘
+         │
+         ├─ command: planner=True  ──→ PLANNER 模式（站立/步行）
+         │
+         └─ command: planner=False ──→ STREAMED_MOTION 模式（遥操/回放）
+
 推荐用采数同款控制器（`--input-type zmq_manager`）。回放脚本会 **PUB bind** `tcp://*:5556`，C++ 默认 `--zmq-host localhost` SUB connect；两端都在工作站跑。
 
+#### 方式一：先启用控制，再回放（推荐）
+
 ```bash
-# 1) 工作站：只启动一个 deploy（关掉其它占用 5556 / DDS 的旧进程）
+# 1) 工作站：启动 deploy
 bash ./real/SONIC/scripts/collect_psi0-sonic-data-manual.sh deploy
 # 等到 Init Done / [ZMQManager] Host: localhost:5556
 
-# 2) 工作站：token 回放（先 planner=True 进 CONTROL，再切 STREAMED_MOTION）
+# 2) 另开终端：自动启用机器人控制（保持站稳状态）
+python scripts/replay/enable_control.py
+# 按 Ctrl+C 停止控制并退出
+
+# 3) 回放
 python scripts/replay/replay_real.py \
   --mode token \
   --episode_idx 0 \
   --input_type zmq_manager \
   --data_dir /home/karthus_chen/ycb_ws/datasets/SONIC/test/2026-07-23/
 ```
+
+#### 方式二：一条命令启动 deploy + 自动控制
+
+```bash
+# 启动 deploy，等 5 秒后自动启用控制
+(cd /home/zzz/zzy/Psi0 && bash ./real/SONIC/scripts/collect_psi0-sonic-data-manual.sh deploy &) && sleep 5 && python scripts/replay/enable_control.py
+```
+
+> **说明**：`enable_control.py` 会发送 ZMQ 命令让机器人进入 PLANNER 模式并保持站立状态，这样回放时机器人已经处于"被运控接管"的状态，不会软倒。
 
 成功时 deploy 端应依次出现：
 - `[ZMQManager] Planner enabled` / `motion name is planner_motion`
