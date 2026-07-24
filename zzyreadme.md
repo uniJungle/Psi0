@@ -479,3 +479,34 @@ python scripts/replay/replay_real.py \
 - 不要边开 pico 边回放（pico 也会 bind 5556，端口冲突）。
 - 若只看到 token 日志但机器人不动，多半是 `start` 握手失败（必须先 `planner=True` 再切 streamed）；当前 `replay_real.py` 已按该顺序发送。
 
+## 5.4 暂停恢复逻辑
+
+### 现在的录制中暂停逻辑
+
+首先是录制过程：
+
+```bash
+# SONIC C++ 控制器
+bash ./real/SONIC/scripts/collect_psi0-sonic-data-manual.sh deploy
+
+#启动 PICO 遥操作系统
+bash ./real/SONIC/scripts/collect_psi0-sonic-data-manual.sh pico \
+    --eef brainco \
+    --dds-interface enp4s0
+
+# 数据录制导出逻辑
+# 双目：ego_view_left / ego_view_right
+bash ./real/SONIC/scripts/collect_psi0-sonic-data-manual.sh exporter \
+    --task-prompt "Pick bottle and pour into cup." \
+    --task-name "test" \
+    --root-output-dir /home/karthus_chen/ycb_ws/datasets/SONIC \
+    --use-stereo-camera \
+    --eef brainco
+```
+
+但是当前的录制逻辑，我在录制中会按B暂停机器人动作，然后人调整位置，录制下来的数据会把暂停过程同样保留下来，这是我不希望的，我希望暂停时和恢复后中间这一段的图像和数据都不要保存，恢复后正常继续保存。
+
+### 需要
+一个是我暂停之后数据，录制同样暂停，但是这个录制的信息有很多，可能需要对齐一下，每种数据恢复之后怎么处理。
+
+还有就是，我暂停之后，人的位置和朝向都移动了，我恢复遥操时机器人会不会产生动作和朝向的跳变。
