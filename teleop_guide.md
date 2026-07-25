@@ -89,9 +89,6 @@ bash ./real/SONIC/scripts/collect_psi0-sonic-data-manual.sh deploy
 bash ./real/SONIC/scripts/collect_psi0-sonic-data-manual.sh pico \
     --eef brainco \
     --dds-interface enp4s0
-
-# 关闭手控
-bash ./real/SONIC/scripts/collect_psi0-sonic-data-manual.sh pico --eef none
 ```
 
 安装、DDS 通信与依赖见 [BRAINCO_HAND.md](real/SONIC/BRAINCO_HAND.md)。
@@ -102,18 +99,12 @@ bash ./real/SONIC/scripts/collect_psi0-sonic-data-manual.sh pico --eef none
 # 双目：ego_view_left / ego_view_right
 bash ./real/SONIC/scripts/collect_psi0-sonic-data-manual.sh exporter \
     --task-prompt "Pick bottle and pour into cup." \
-    --task-name "test" \
-    --root-output-dir /home/karthus_chen/ycb_ws/datasets/SONIC \
+    --task-name "pico_kill_record_test" \
+    --root-output-dir /home/karthus_chen/ycb_ws/datasets/SONIC/test \
     --use-stereo-camera \
     --eef brainco
 
-# 单目：ego_view
-bash ./real/SONIC/scripts/collect_psi0-sonic-data-manual.sh exporter \
-    --task-prompt "Pick bottle and pour into cup." \
-    --task-name "test" \
-    --root-output-dir /home/karthus_chen/ycb_ws/datasets/SONIC \
-    --use-mono-camera \
-    --eef brainco
+# 单目：ego_view 选择 --use-mono-camera
 ```
 
 ## 数据采集
@@ -123,17 +114,22 @@ bash ./real/SONIC/scripts/collect_psi0-sonic-data-manual.sh exporter \
     - **A+X**：遥操（POSE）↔ 规划（PLANNER）
     - **Y**：遥操暂停 ↔ 恢复遥操
     - **A+B+X+Y**：急停并退出策略
-3. **规划模式移动**（进入 PLANNER 后）：
+3. **PICO 断连安全**（头显串流中断，或 **Ctrl+C 退出 pico 进程**）：
+    - pico 退出前会向 deploy 发 **PLANNER + IDLE** handoff，并播报「PICO断开，进入待机模式」
+    - deploy 侧：若遥操 pose 流 **>1s** 无数据，也会自动切 **PLANNER + IDLE**（不冻结最后一帧）
+    - **deploy 改动需重新编译**：改完 `zmq_manager.hpp` 后重启 `collect_psi0-sonic-data-manual.sh deploy`
+    - 串流/进程恢复后可正常 **A+X** 切换模式
+4. **规划模式移动**（进入 PLANNER 后）：
     - 默认即锁定 **SLOW_WALK（慢走）**：左摇杆可直接平移，右摇杆左右控制朝向
     - 松杆时下发 IDLE，机器人站定
-4. **双手开合**（Brainco，PICO；manager 启动后即可用）：
+5. **双手开合**（Brainco，PICO；manager 启动后即可用）：
     - **左 trigger**：左手开合
     - **右 trigger**：右手开合
     - 终端应周期性打印 `[Brainco] trigger L=.. R=..`；若有打印但手不动，查机器人 `brainco_hand` / DDS 网卡
-5. **录制 episode**（PICO）：
+6. **录制 episode**（PICO）：
     - **left grip + A**：开始 / 停止录制
     - **left grip + B**：丢弃当前 episode（仍会落盘，并在 `meta/info.json` 的 `discarded_episode_indices` 中标记）
-6. **数据保存路径**（默认）：
+7. **数据格式**（Lerobot v2.1）：
 
     ```text
     /<root-output-dir>/<task_name>/<YYYY-MM-DD>/
@@ -142,6 +138,62 @@ bash ./real/SONIC/scripts/collect_psi0-sonic-data-manual.sh exporter \
     ├── videos/.../observation.images.ego_view_right/
     └── meta/{info.json, modality.json, episodes.jsonl, tasks.jsonl}
     ```
+
+## 真机回放数据
+
+使用采数同款控制器（`--input-type zmq_manager`）。回放脚本会 **PUB bind** `tcp://*:5556`，C++ 默认 `--zmq-host localhost` SUB connect；两端都在工作站跑。
+
+### 1. 启动 SONIC C++ 控制器
+```bash
+# 等到 Init Done / [ZMQManager] Host: localhost:5556
+cd ~/ycb_ws/Psi0/
+bash ./real/SONIC/scripts/collect_psi0-sonic-data-manual.sh deploy
+```
+
+### 进入规划模式保持站立
+
+```bash
+# 站稳后自动退出并释放 5556
+# 默认：start+planner → idle 约 3s → 释放 PUB（不发 stop）→ 进程退出
+cd ~/ycb_ws/Psi0/
+source .venv-psi/bin/activate
+
+python scripts/replay/enable_control.py
+```
+
+### 真机回放（必须 bind 5556）
+```bash
+cd ~/ycb_ws/Psi0/
+source .venv-psi/bin/activate
+
+python scripts/replay/replay_real.py \
+  --input_type zmq_manager \
+  --dds-interface enp4s0 \
+  --zmq_port 5556 \
+  --eef brainco \
+  --mode token \
+  --data_dir /home/karthus_chen/ycb_ws/datasets/SONIC/test/tpose_halt \
+  --episode_idx 1
+```
+
+说明：
+
+- `enable_control.py` 与 `replay_real.py` **不能同时** bind `tcp://*:5556`。
+- `enable_control` 默认 **handoff**：站稳后退出并释放端口（不发 `stop`）；不要用旧版一直发 idle planner 的方式（会把回放顶回规划）。
+- 若需要长时间保持站立再手动开回放：`python scripts/replay/enable_control.py --hold`，**先 Ctrl+C 释放端口**，再跑 `replay_real.py`。
+- 回放默认端口为 `5556`；若指定 `--zmq_port 5559`，deploy（听 5556）收不到指令。
+- 回放结束后脚本会**切回 idle PLANNER 并释放 5556**（不发 `stop`），**deploy 继续运行**。
+- 不要边开 pico 边回放（pico 也会 bind 5556，且会抢 Brainco DDS）。
+- `replay_real.py` 会先 `planner=True` 进 CONTROL，再切 STREAMED_MOTION 发 token。
+- **Brainco 手不经过 deploy**：数据集有 `teleop.*_hand_joints`（2D）时须加 `--eef brainco`，并保证机器人 `brainco_hand` 服务已起；仅 token 回放时手不会动。
+- 默认会弹出 OpenCV 窗口 `Replay Video`，按帧同步播放该 episode 的左右眼视频；不需要时可加 `--no-video`。
+
+成功时 deploy 端应依次出现：
+
+- `[ZMQManager] Planner enabled` / `motion name is planner_motion`
+- `[Control] ... transitioning to CONTROL state`
+- `[ZMQManager] Switched to: STREAMED MOTION` / `ZMQ STREAMING MODE: ENABLED`
+- `[ZMQEndpointInterface] Protocol v4: Received 64D token ...`
 
 ## 数据后处理
 

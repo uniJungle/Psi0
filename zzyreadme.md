@@ -480,26 +480,33 @@ deploy --input-type zmq_manager
 bash ./real/SONIC/scripts/collect_psi0-sonic-data-manual.sh deploy
 # 等到 Init Done / [ZMQManager] Host: localhost:5556
 
-# 2) 另开终端：自动启用机器人控制（保持站稳状态）
+# 2) 另开终端：站稳后自动退出并释放 5556（不要用 --hold 一直占着端口）
 python scripts/replay/enable_control.py
-# 按 Ctrl+C 停止控制并退出
+# 默认：start+planner → idle 约 3s → 释放 PUB（不发 stop）→ 进程退出
+# 机器人仍停在 PLANNER/CONTROL，端口已空给回放
 
-# 3) 回放
+# 3) 同一机器回放（必须 bind 5556，不要用 5559）
 python scripts/replay/replay_real.py \
   --mode token \
   --episode_idx 0 \
   --input_type zmq_manager \
-  --data_dir /home/karthus_chen/ycb_ws/datasets/SONIC/test/2026-07-23/
+  --zmq_port 5556 \
+  --data_dir /home/karthus_chen/ycb_ws/datasets/SONIC/no_halt
 ```
 
 #### 方式二：一条命令启动 deploy + 自动控制
 
 ```bash
-# 启动 deploy，等 5 秒后自动启用控制
-(cd /home/zzz/zzy/Psi0 && bash ./real/SONIC/scripts/collect_psi0-sonic-data-manual.sh deploy &) && sleep 5 && python scripts/replay/enable_control.py
+# 启动 deploy，等 5 秒后站稳并释放端口（随后再开终端跑 replay）
+(bash ./real/SONIC/scripts/collect_psi0-sonic-data-manual.sh deploy &) && sleep 5 && python scripts/replay/enable_control.py
 ```
 
-> **说明**：`enable_control.py` 会发送 ZMQ 命令让机器人进入 PLANNER 模式并保持站立状态，这样回放时机器人已经处于"被运控接管"的状态，不会软倒。
+> **说明**：
+> - `enable_control.py` 与 `replay_real.py` **不能同时** bind `tcp://*:5556`。
+> - 旧版 `enable_control` 会一直发 idle planner，把回放切到的 `STREAMED_MOTION` 顶回规划；现已改为默认 **handoff**：站稳后退出并释放端口（不发 `stop`）。
+> - 若需要长时间保持站立再手动开回放：`python scripts/replay/enable_control.py --hold`，**先 Ctrl+C 释放端口**，再跑 `replay_real.py`。
+> - 回放默认端口已改为 `5556`；若仍指定 `--zmq_port 5559`，deploy（听 5556）收不到指令。
+> - 回放结束后脚本会**切回 idle PLANNER 并释放 5556**（不发 `stop`），**deploy 继续运行**；不要再用旧版 `stop=True` 退出。
 
 成功时 deploy 端应依次出现：
 - `[ZMQManager] Planner enabled` / `motion name is planner_motion`
