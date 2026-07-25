@@ -100,7 +100,7 @@ bash ./real/SONIC/scripts/collect_psi0-sonic-data-manual.sh pico \
 bash ./real/SONIC/scripts/collect_psi0-sonic-data-manual.sh exporter \
     --task-prompt "Pick bottle and pour into cup." \
     --task-name "pico_kill_record_test" \
-    --root-output-dir /home/karthus_chen/ycb_ws/datasets/SONIC/test \
+    --root-output-dir /home/karthus_chen/ycb_ws/datasets/SONIC/test/tts_test \
     --use-stereo-camera \
     --eef brainco
 
@@ -172,7 +172,7 @@ python scripts/replay/replay_real.py \
   --zmq_port 5556 \
   --eef brainco \
   --mode token \
-  --data_dir /home/karthus_chen/ycb_ws/datasets/SONIC/test/tpose_halt \
+  --data_dir /home/karthus_chen/ycb_ws/datasets/SONIC/test/tts_test \
   --episode_idx 1
 ```
 
