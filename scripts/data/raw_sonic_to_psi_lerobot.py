@@ -43,8 +43,10 @@ SRC_MOTION_TOKEN = "action.motion_token"   # 64
 #   [0:15] lower (left_leg6, right_leg6, waist3) | [15:22] larm | [22:29] lhand
 #   [29:36] rarm | [36:43] rhand
 # Psi0 puts hands last: qpos(29)=lower+larm+rarm, hand(14)=lhand+rhand.
-QPOS_SLICES = [(0, 15), (15, 22), (29, 36)]   # -> 29
-HAND_SLICES = [(22, 29), (36, 43)]            # -> 14
+# For 43-dim: QPOS_SLICES = [(0, 15), (15, 22), (29, 36)] -> 29, HAND_SLICES = [(22, 29), (36, 43)] -> 14
+# For 33-dim (brainco): qpos(29) + hand(4, 2 per hand)
+QPOS_SLICES_43 = [(0, 15), (15, 22), (29, 36)]   # -> 29
+HAND_SLICES_43 = [(22, 29), (36, 43)]            # -> 14
 
 # Psi0 output dims: states = qpos(29)+hand(14 or 4), action = motion_token(64)+hand(14 or 4)
 # We will determine STATE_DIM and ACTION_DIM dynamically based on the input hand dimension.
@@ -149,8 +151,13 @@ class Sonic2LeRobotConverter:
     def build_obs(self, state_wbc: np.ndarray) -> Dict[str, Any]:
         # state_wbc is either 43-dim (dex3) or 33-dim (brainco)
         # qpos is the first 29 dims, hand is the rest
-        qpos = take_slices(state_wbc, QPOS_SLICES)
-        hand = state_wbc[29:]
+        if len(state_wbc) == 43:
+            qpos = take_slices(state_wbc, QPOS_SLICES_43)
+            hand = state_wbc[29:]
+        else:
+            # 33-dim: qpos(29) + hand(4)
+            qpos = state_wbc[:29]
+            hand = state_wbc[29:]
         states = np.concatenate([qpos, hand])
         return {"states": states.astype(np.float32).tolist()}
 

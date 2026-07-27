@@ -459,7 +459,7 @@ ZMQManager 有两种工作模式：
 │
 └── STREAMED_MOTION 模式 (ManagedMode::STREAMED_MOTION)
     └── 接收 pose 主题的流式动作数据（遥操/回放）
-    
+
 deploy --input-type zmq_manager
          │
          ▼
@@ -550,3 +550,46 @@ bash ./real/SONIC/scripts/collect_psi0-sonic-data-manual.sh exporter \
 一个是我暂停之后数据，录制同样暂停，但是这个录制的信息有很多，可能需要对齐一下，每种数据恢复之后怎么处理。
 
 还有就是，我暂停之后，人的位置和朝向都移动了，我恢复遥操时机器人会不会产生动作和朝向的跳变。
+
+
+# 6. g1-sonic训练部署
+## 6.1 ACT
+创建环境：
+```bash
+uv venv .venv-act --python 3.10
+source .venv-act/bin/activate
+GIT_LFS_SKIP_SMUDGE=1 uv sync --group psi --group serve --group viz --active --frozen
+```
+
+数据集lerobotv2.1目录（转换后）： /home/zzz/unitree_sh_disk/tools/ycb/datasets/SONIC_converted/walk_to_table_and_place_apple
+
+```bash
+python scripts/data/raw_sonic_to_psi_lerobot.py \
+    --data-root /home/zzz/unitree_sh_disk/tools/ycb/datasets/SONIC/walk_to_table_and_place_apple_on_pink_plate \
+    --work-dir /home/zzz/unitree_sh_disk/tools/ycb/datasets/SONIC_converted \
+    --repo-id walk_to_table_and_place_apple \
+    --use-stereo-camera \
+    --eef brainco
+
+转换之后：
+state 应该是29+4=33，即29关节+2*手（2）
+action 应该是68维，64+4
+
+计算stats：原始：observation.state, action.wbc；转换后：states, action (这是转换脚本做的列名映射)
+
+python scripts/data/calc_modality_stats.py \
+  --work-dir=/home/zzz/unitree_sh_disk/tools/ycb/datasets/SONIC_converted \
+  --task=walk_to_table_and_place_apple
+
+# wandbkey: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
+# sm120
+uv pip install torch==2.7.0+cu128 torchvision==0.22.0+cu128 torchaudio==2.7.0+cu128 --index-url https://download.pytorch.org/whl/cu128 --python .venv-act
+
+bash baselines/act/train_act_g1_real.sh walk_to_table_and_place_apple # 真机实验训练
+```
+
+|=========================================+========================+======================|
+|   0  NVIDIA GeForce RTX 5080        On  |   00000000:02:00.0  On |                  N/A |
+|  0%   42C    P1             68W /  360W |    3571MiB /  16303MiB |      0%      Default |
+|                                         |                        |                  N/A |
++-----------------------------------------+------------------------+----------------------+
