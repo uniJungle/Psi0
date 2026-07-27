@@ -1,5 +1,8 @@
 # Ψ₀ 与 SONIC — 遥操作与数据采集
 
+使用 Brainco 双手、头部双目相机和 low-latency SONIC 模型进行真机数采时，
+请直接阅读 [Low-latency Quick Start](QUICKSTART_LOW_LATENCY.md)。
+
 我们遵循官方 [SONIC](https://github.com/NVlabs/GR00T-WholeBodyControl) 的设置方式。所有命令请从子模块根目录 `third_party/GR00T-WholeBodyControl` 执行。
 
 ## 设置（在工作站上）

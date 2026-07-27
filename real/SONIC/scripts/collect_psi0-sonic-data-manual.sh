@@ -4,14 +4,15 @@
 # terminal. Use this if tmux is not available.
 #
 # Real robot (start the camera server on the robot first):
-#   bash ./real/SONIC/scripts/collect_psi0-sonic-data-manual.sh deploy     # 1) C++ controller
+#   bash ./real/SONIC/scripts/collect_psi0-sonic-data-manual.sh deploy \
+#       --low-latency                                                   # 1) C++ controller
 #   bash ./real/SONIC/scripts/collect_psi0-sonic-data-manual.sh pico       # 2) PICO streamer
 #   bash ./real/SONIC/scripts/collect_psi0-sonic-data-manual.sh exporter \
 #       --use-stereo-camera                                               # 3) data exporter (records)
 #
-# PICO options (defaults: Brainco on enp4s0):
+# PICO options (defaults: Brainco on enx6c1ff7c12485):
 #   bash ./real/SONIC/scripts/collect_psi0-sonic-data-manual.sh pico \
-#       --eef brainco --dds-interface enp4s0
+#       --eef brainco --dds-interface enx6c1ff7c12485
 #   bash ./real/SONIC/scripts/collect_psi0-sonic-data-manual.sh pico --eef none
 #
 # Exporter camera (required; mutually exclusive):
@@ -23,25 +24,29 @@
 #   bash ./real/SONIC/scripts/collect_psi0-sonic-data-manual.sh deploy sim  # 2) C++ controller (sim)
 #   bash ./real/SONIC/scripts/collect_psi0-sonic-data-manual.sh pico        # 3) PICO streamer
 
+PSI0_ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
+
 ROBOT_IP=192.168.123.164
 TASK="Pick bottle and turn and pour into cup."
 TASK_NAME="pick_bottle"
 FPS=30
-OUTPUT_DIR="/home/karthus_chen/ycb_ws/datasets/SONIC"
+OUTPUT_DIR="$PSI0_ROOT/outputs/SONIC"
 EEF="brainco"
-DDS_INTERFACE="enp4s0"
+DDS_INTERFACE="enx6c1ff7c12485"
 CAMERA_MODE=""  # stereo | mono
+LOW_LATENCY=false
 
-SONIC_DIR="$(cd "$(dirname "$0")/../../../third_party/GR00T-WholeBodyControl" && pwd)"
+SONIC_DIR="$(cd "$PSI0_ROOT/third_party/GR00T-WholeBodyControl" && pwd)"
 cd "$SONIC_DIR"
 
-USAGE="Usage: $0 {sim|deploy [sim]|pico|exporter} [options]
+USAGE="Usage: $0 {sim|deploy [sim|real|IFACE|IP]|pico|exporter} [options]
 Options:
+  --low-latency                (deploy; use policy/low_latency 4-frame SONIC model)
   --task-prompt TEXT
   --task-name NAME
   --root-output-dir DIR
   --eef {none|brainco|dex3}     (pico: none|brainco; exporter: dex3|brainco; default: brainco)
-  --dds-interface IFACE         (pico; default: enp4s0)
+  --dds-interface IFACE         (pico/exporter; default: enx6c1ff7c12485)
   --use-stereo-camera           (exporter; stereo ego_view_left/right)
   --use-mono-camera             (exporter; mono ego_view)"
 
@@ -54,7 +59,7 @@ shift
 
 DEPLOY_TARGET="real"
 if [ "$MODE" = "deploy" ]; then
-    if [ "${1:-}" = "sim" ] || [ "${1:-}" = "real" ]; then
+    if [ -n "${1:-}" ] && [[ "$1" != --* ]]; then
         DEPLOY_TARGET="$1"
         shift
     fi
@@ -62,6 +67,10 @@ fi
 
 while [ $# -gt 0 ]; do
     case "$1" in
+        --low-latency)
+            LOW_LATENCY=true
+            shift
+            ;;
         --task-prompt)
             TASK="$2"
             shift 2
@@ -108,6 +117,12 @@ while [ $# -gt 0 ]; do
     esac
 done
 
+if [ "$LOW_LATENCY" = true ] && [ "$MODE" != "deploy" ]; then
+    echo "--low-latency is only valid with deploy"
+    echo "$USAGE"
+    exit 1
+fi
+
 case "$MODE" in
     sim)
         source .venv_teleop/bin/activate
@@ -116,7 +131,28 @@ case "$MODE" in
     deploy)
         cd gear_sonic_deploy
         source scripts/setup_env.sh
-        ./deploy.sh --input-type zmq_manager "$DEPLOY_TARGET"
+        DEPLOY_ARGS=(--input-type zmq_manager)
+        if [ "$LOW_LATENCY" = true ]; then
+            LOW_LATENCY_MODEL="policy/low_latency/model"
+            LOW_LATENCY_CONFIG="policy/low_latency/observation_config.yaml"
+            for REQUIRED_FILE in \
+                "${LOW_LATENCY_MODEL}_decoder.onnx" \
+                "${LOW_LATENCY_MODEL}_encoder.onnx" \
+                "$LOW_LATENCY_CONFIG"; do
+                if [ ! -f "$REQUIRED_FILE" ]; then
+                    echo "Missing low-latency file: $PWD/$REQUIRED_FILE"
+                    exit 1
+                fi
+            done
+            DEPLOY_ARGS+=(
+                --cp "$LOW_LATENCY_MODEL"
+                --obs-config "$LOW_LATENCY_CONFIG"
+            )
+            echo "[deploy] SONIC model=low-latency (SMPL 4-frame lookahead)"
+        else
+            echo "[deploy] SONIC model=release (default)"
+        fi
+        ./deploy.sh "${DEPLOY_ARGS[@]}" "$DEPLOY_TARGET"
         ;;
     pico)
         source .venv_teleop/bin/activate
