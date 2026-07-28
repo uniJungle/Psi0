@@ -442,13 +442,7 @@ class ReplaySim:
 class KeyboardController:
     """Terminal keyboard input listener (non-blocking, independent thread)."""
 
-    # ANSI escape codes for special keys
-    ESC = "\x1b"
-    ARROW_UP = ESC + "[A"
-    ARROW_DOWN = ESC + "[B"
-    ARROW_RIGHT = ESC + "[C"
-    ARROW_LEFT = ESC + "[D"
-    ENTER = "\n"
+    # No arrow keys - using z/c for episode navigation
 
     def __init__(self):
         self._running = True
@@ -475,35 +469,13 @@ class KeyboardController:
 
     def _read_loop(self):
         """Background thread that reads keyboard input."""
+        import select
         while self._running:
             try:
-                ch = sys.stdin.read(1)
-                if ch:
-                    # Handle escape sequences (arrow keys, etc.)
-                    if ch == self.ESC:
-                        # Peek at next char to detect arrow keys
-                        import select
-                        if select.select([sys.stdin], [], [], 0.05)[0]:
-                            next_ch = sys.stdin.read(1)
-                            if next_ch == "[":
-                                if select.select([sys.stdin], [], [], 0.05)[0]:
-                                    arrow = sys.stdin.read(1)
-                                    if arrow == "A":
-                                        self._key_queue.put(self.ARROW_UP)
-                                        continue
-                                    elif arrow == "B":
-                                        self._key_queue.put(self.ARROW_DOWN)
-                                        continue
-                                    elif arrow == "C":
-                                        self._key_queue.put(self.ARROW_RIGHT)
-                                        continue
-                                    elif arrow == "D":
-                                        self._key_queue.put(self.ARROW_LEFT)
-                                        continue
-                            self._key_queue.put(self.ESC)
-                        else:
-                            self._key_queue.put(self.ESC)
-                    else:
+                # Use select to wait for input with timeout
+                if select.select([sys.stdin], [], [], 0.05)[0]:
+                    ch = sys.stdin.read(1)
+                    if ch:
                         self._key_queue.put(ch)
             except Exception:
                 break
@@ -512,9 +484,16 @@ class KeyboardController:
     def start(self):
         """Start the keyboard listener thread."""
         self._setup_terminal()
+        self._drain_input()  # Clear any buffered input
         self._thread = threading.Thread(target=self._read_loop, daemon=True)
         self._thread.start()
         print("[Keyboard] Control enabled")
+
+    def _drain_input(self):
+        """Drain any buffered input from stdin."""
+        import select
+        while select.select([sys.stdin], [], [], 0.01)[0]:
+            sys.stdin.read(10)  # Read up to 10 chars at a time
 
     def stop(self):
         """Stop the keyboard listener and restore terminal."""
@@ -557,6 +536,7 @@ class InteractiveReplaySim:
         zmq_port: int = 5556,
         mode: str = "token",
         slow_walk_speed: float = 0.3,
+        turn_speed: float = 1.0,
         data_dirs: Optional[list[str]] = None,
     ):
         """
@@ -575,6 +555,7 @@ class InteractiveReplaySim:
         self.frame_duration = 1.0 / fps
         self.mode = mode
         self.slow_walk_speed = slow_walk_speed
+        self.turn_speed = turn_speed
         self.data_dirs = data_dirs or [data_dir]
 
         # State
@@ -590,8 +571,11 @@ class InteractiveReplaySim:
         self.facing_yaw = 0.0
         self.facing_yaw_delta = math.pi / 12  # +/- 15 degrees
 
-        # Movement direction for slow_walk mode
-        self.movement = [0.0, 0.0, 0.0]
+        # Movement direction for slow_walk mode (reset when keys released)
+        self.movement = [0.0, 0.0, 0.0]  # [forward, strafe, turn]
+        self._keys_pressed: set = set()  # Track currently pressed keys
+        self._key_timestamps: dict = {}  # Track when each key was last pressed
+        self._key_timeout = 0.1  # Seconds before considering key released
 
         # Keyboard controller
         self.kb = KeyboardController()
@@ -724,10 +708,12 @@ class InteractiveReplaySim:
         """Send slow walk command with current movement vector."""
         facing_x = math.cos(self.facing_yaw)
         facing_y = math.sin(self.facing_yaw)
+        if self.current_frame_idx == 0:  # Only log once
+            print(f"[DEBUG] _send_slow_walk: movement={self.movement}, facing=[{facing_x:.2f}, {facing_y:.2f}]")
         msg = build_planner_message(
             mode=self.LOCOMOTION_MODE_SLOW_WALK,
-            movement=self.movement,
-            facing=[facing_x, facing_y, 0.0],
+            movement=[self.movement[0], self.movement[1], 0.0],  # [forward, strafe, 0]
+            facing=[facing_x, facing_y, 0.0],  # facing direction
             speed=self.slow_walk_speed,
             height=-1.0,
         )
@@ -746,7 +732,60 @@ class InteractiveReplaySim:
             self.current_mode = InteractiveReplayMode.SLOW_WALK
             self.replay_running = False
             self.movement = [0.0, 0.0, 0.0]
+            self._keys_pressed.clear()
+            self._key_timestamps.clear()
             print("[InteractiveReplay] Mode: SLOW_WALK")
+
+    def _update_movement(self):
+        """Update movement vector based on currently pressed keys."""
+        # Local movement (relative to facing direction)
+        local_forward = 0.0  # ly: W=forward, S=backward
+        local_strafe = 0.0   # lx: D=right, A=left
+        if "w" in self._keys_pressed:
+            local_forward = 1.0
+        elif "s" in self._keys_pressed:
+            local_forward = -1.0
+        if "a" in self._keys_pressed:
+            local_strafe = 1.0
+        elif "d" in self._keys_pressed:
+            local_strafe = -1.0
+        
+        # Turning (updates facing_yaw)
+        if "q" in self._keys_pressed:
+            self.facing_yaw -= self.turn_speed * 0.033
+        elif "e" in self._keys_pressed:
+            self.facing_yaw += self.turn_speed * 0.033
+        
+        # Convert local movement to world coordinates (same as official pico_manager)
+        # facing = [cos(yaw), sin(yaw)]
+        # rotation: world = R @ local, where R = [[-sin, cos], [cos, sin]]
+        facing_x = math.cos(self.facing_yaw)
+        facing_y = math.sin(self.facing_yaw)
+        perp_x = -facing_y
+        perp_y = facing_x
+        
+        # world_x = perp_x * local_x + facing_x * local_y
+        # world_y = perp_y * local_x + facing_y * local_y
+        world_x = perp_x * local_strafe + facing_x * local_forward
+        world_y = perp_y * local_strafe + facing_y * local_forward
+        
+        self.movement = [world_x, world_y, 0.0]
+
+    def _check_key_timeouts(self):
+        """Check for key timeouts and release keys that haven't been refreshed."""
+        if self.current_mode != InteractiveReplayMode.SLOW_WALK:
+            return
+        current_time = time.time()
+        keys_to_release = []
+        for key in self._keys_pressed:
+            if key in self._key_timestamps:
+                if current_time - self._key_timestamps[key] > self._key_timeout:
+                    keys_to_release.append(key)
+        if keys_to_release:
+            for key in keys_to_release:
+                self._keys_pressed.discard(key)
+                self._key_timestamps.pop(key, None)
+            self._update_movement()
 
     def _start_replay(self):
         """Start replaying the current episode."""
@@ -763,7 +802,10 @@ class InteractiveReplaySim:
                     print("[InteractiveReplay] Failed to load episode, cannot start replay")
                     return
 
-            # Start replay
+            # Start replay - switch to STREAMED_MOTION mode first
+            if self.mode == "token":
+                self.zmq.send_command(start=True, stop=False, planner=False)
+                time.sleep(0.5)
             self.current_mode = InteractiveReplayMode.PLAYING
             self.replay_running = True
             self.current_frame_idx = 0
@@ -784,42 +826,42 @@ class InteractiveReplaySim:
                 # Stop replay first, then toggle
                 self._start_replay()
 
-        elif key == KeyboardController.ENTER:
+        elif key == "\n":  # Enter
             self._start_replay()
 
-        elif key == KeyboardController.ARROW_UP:
+        elif key in ("z", "Z"):
             self._navigate_episode(-1)
 
-        elif key == KeyboardController.ARROW_DOWN:
+        elif key in ("c", "C"):
             self._navigate_episode(1)
 
-        elif key == "q" or key == "Q":
-            if self.current_mode == InteractiveReplayMode.IDLE_PLANER:
-                self.facing_yaw -= self.facing_yaw_delta
-                print(f"[InteractiveReplay] Facing: {math.degrees(self.facing_yaw):.1f} deg")
-
-        elif key == "e" or key == "E":
-            if self.current_mode == InteractiveReplayMode.IDLE_PLANER:
-                self.facing_yaw += self.facing_yaw_delta
+        elif key in ("q", "Q", "e", "E"):
+            if self.current_mode == InteractiveReplayMode.SLOW_WALK:
+                # Q/E for turning in slow walk mode
+                self._keys_pressed.add(key.lower())
+                self._key_timestamps[key.lower()] = time.time()
+                self._update_movement()
+            elif self.current_mode == InteractiveReplayMode.IDLE_PLANER:
+                # Instant turn in idle mode
+                if key in ("q", "Q"):
+                    self.facing_yaw -= self.facing_yaw_delta
+                else:
+                    self.facing_yaw += self.facing_yaw_delta
                 print(f"[InteractiveReplay] Facing: {math.degrees(self.facing_yaw):.1f} deg")
 
         elif key in ("w", "W", "a", "A", "s", "S", "d", "D"):
+            print(f"[DEBUG] WASD key: {repr(key)}, mode: {self.current_mode}")
             if self.current_mode == InteractiveReplayMode.SLOW_WALK:
-                # WASD for movement (relative to facing direction)
-                forward = 0.0
-                strafe = 0.0
-                if key in ("w", "W"):
-                    forward = 1.0
-                elif key in ("s", "S"):
-                    forward = -1.0
-                elif key in ("a", "A"):
-                    strafe = -1.0
-                elif key in ("d", "D"):
-                    strafe = 1.0
-                # Movement is relative to facing direction
-                self.movement = [forward, strafe, 0.0]
+                self._keys_pressed.add(key.lower())
+                self._key_timestamps[key.lower()] = time.time()
+                self._update_movement()
+                print(f"[DEBUG] movement: {self.movement}")
+            elif self.current_mode == InteractiveReplayMode.IDLE_PLANER:
+                # Q/E for turning, but WASD doesn't work in IDLE mode
+                print("[DEBUG] WASD ignored - not in SLOW_WALK mode")
+                pass
 
-        elif key == KeyboardController.ESC or key == "\x03":  # Ctrl+C
+        elif key == "\x1b" or key == "\x03":  # ESC or Ctrl+C
             print("[InteractiveReplay] Quit requested")
             self.running = False
 
@@ -830,8 +872,9 @@ class InteractiveReplaySim:
         print("=" * 50)
         print("  1          - Toggle IDLE_PLANER / SLOW_WALK mode")
         print("  W/A/S/D    - Move (in SLOW_WALK mode)")
-        print("  Q / E      - Turn left/right (in IDLE_PLANER mode)")
-        print("  Up/Down    - Previous/Next episode")
+        print("  Q / E      - Turn left/right")
+        print("  Z          - Previous episode")
+        print("  C          - Next episode")
         print("  Enter      - Play/Stop current episode")
         print("  Ctrl+C     - Exit")
         print("=" * 50 + "\n")
@@ -868,6 +911,9 @@ class InteractiveReplaySim:
 
                 if not self.running:
                     break
+
+                # Check for key timeouts (key released detection)
+                self._check_key_timeouts()
 
                 # Send control commands based on mode
                 if self.current_mode == InteractiveReplayMode.IDLE_PLANER:
