@@ -584,7 +584,8 @@ python scripts/data/raw_sonic_to_psi_lerobot.py \
     --repo-id walk_to_table_and_place_apple \
     --use-stereo-camera \
     --eef brainco
-
+  --dataset_path "/sh/datasets/g1/sonic/walk_to_table_and_place_apple_on_pink_plate_100/lerobot_v2.1" \
+  --output_dir "/sh/ycb/checkpoints/" \
 转换之后：
 state 应该是29+4=33，即29关节+2*手（2）
 action 应该是68维，64+4

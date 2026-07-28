@@ -41,6 +41,14 @@ class ActG1Trainer(Trainer):
         )
 
     @property
+    def run_name(self) -> str:
+        return self.cfg.exp
+
+    @property
+    def project_dir(self) -> str:
+        return os.path.join(self.cfg.train.output_dir, self.run_name)
+
+    @property
     def task_cfg(self) -> TrainConfig:
         return self.cfg.train
 

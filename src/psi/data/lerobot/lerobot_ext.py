@@ -4,6 +4,10 @@ if TYPE_CHECKING:
     from psi.config.data_lerobot import LerobotDataConfig
     # from psi.config.data_simple import SimpleDataConfig
 
+import os
+import packaging.version
+from pathlib import Path
+
 import torch
 from psi.data.lerobot.compat import (
     LeRobotDataset,
@@ -12,6 +16,47 @@ from psi.data.lerobot.compat import (
 )
 from psi.utils import resolve_path
 from psi.config.transform import LerobotRepackTransform
+
+
+def _patch_lerobot_local_only(local_root: Path) -> None:
+    """Use local LeRobot files only; do not fall back to huggingface.co."""
+    if not (local_root / "meta" / "info.json").is_file():
+        raise FileNotFoundError(
+            f"Local LeRobot dataset not found: {local_root} (missing meta/info.json)"
+        )
+
+    import huggingface_hub
+    import lerobot.datasets.lerobot_dataset as lrd
+    import lerobot.datasets.utils as lru
+
+    if getattr(lrd, "_psi_local_only_patch", False):
+        return
+
+    _orig_snapshot_download = huggingface_hub.snapshot_download
+
+    def _local_get_safe_version(repo_id: str, version):
+        v = (
+            packaging.version.parse(version)
+            if not isinstance(version, packaging.version.Version)
+            else version
+        )
+        return f"v{v}"
+
+    def _local_snapshot_download(repo_id, *args, **kwargs):
+        local_dir = kwargs.get("local_dir")
+        if local_dir is not None and Path(local_dir, "meta", "info.json").is_file():
+            return str(local_dir)
+        if os.environ.get("HF_HUB_OFFLINE") == "1":
+            raise RuntimeError(
+                f"HF_HUB_OFFLINE=1 and local dataset incomplete at {local_dir}"
+            )
+        return _orig_snapshot_download(repo_id, *args, **kwargs)
+
+    lru.get_safe_version = _local_get_safe_version
+    lrd.get_safe_version = _local_get_safe_version
+    lrd.snapshot_download = _local_snapshot_download
+    lrd._psi_local_only_patch = True
+
 
 class LeRobotDatasetWrapper(torch.utils.data.Dataset):
     """ A wrapper around LeRobotDataset to support multiple datasets.
@@ -24,7 +69,10 @@ class LeRobotDatasetWrapper(torch.utils.data.Dataset):
     ):
         repo_ids = data_cfg.train_repo_ids if split == "train" else data_cfg.val_repo_ids
         first_repo = repo_ids[0] if isinstance(repo_ids, list) else repo_ids
-        dataset_meta = LeRobotDatasetMetadata(first_repo, resolve_path(f"{data_cfg.root_dir}/{first_repo}"))
+        local_root = Path(resolve_path(f"{data_cfg.root_dir}/{first_repo}"))
+        _patch_lerobot_local_only(local_root)
+
+        dataset_meta = LeRobotDatasetMetadata(first_repo, local_root)
         assert isinstance(data_cfg.transform.repack, LerobotRepackTransform)
         delta_timestamps = data_cfg.transform.repack.delta_timestamps(dataset_meta.fps)
 
@@ -33,7 +81,7 @@ class LeRobotDatasetWrapper(torch.utils.data.Dataset):
             lerobot_dataset_class = MultiLeRobotDataset
         else:
             repo_ids = first_repo
-            root_dir = resolve_path(f"{data_cfg.root_dir}/{first_repo}")
+            root_dir = local_root
             lerobot_dataset_class = LeRobotDataset
 
         self.base_dataset = lerobot_dataset_class(
@@ -41,6 +89,7 @@ class LeRobotDatasetWrapper(torch.utils.data.Dataset):
             root=root_dir,
             delta_timestamps=delta_timestamps, # type: ignore
             image_transforms=None,
+            download_videos=False,
         )
         self._cache = {}
 
