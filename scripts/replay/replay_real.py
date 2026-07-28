@@ -271,6 +271,41 @@ def resolve_episode_parquet(data_dir: str | Path, episode_idx: int) -> Path:
     return parquet_path
 
 
+def resolve_episode_task_prompt(data_dir: str | Path, episode_idx: int) -> str:
+    """Load task prompt text for episode_idx from meta/episodes.jsonl (fallback: tasks.jsonl)."""
+    data_path = Path(data_dir)
+    episodes_path = data_path / "meta" / "episodes.jsonl"
+    if episodes_path.is_file():
+        with open(episodes_path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                ep = json.loads(line)
+                if int(ep.get("episode_index", -1)) != episode_idx:
+                    continue
+                tasks = ep.get("tasks") or []
+                if isinstance(tasks, list) and tasks:
+                    return str(tasks[0])
+                if isinstance(tasks, str) and tasks:
+                    return tasks
+                break
+
+    tasks_path = data_path / "meta" / "tasks.jsonl"
+    if tasks_path.is_file():
+        with open(tasks_path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                item = json.loads(line)
+                task = item.get("task")
+                if task:
+                    return str(task)
+                break
+    return ""
+
+
 def resolve_episode_videos(
     data_dir: str | Path,
     episode_idx: int,
@@ -316,10 +351,17 @@ class EpisodeVideoPreview:
 
     WINDOW_NAME = "Replay Video"
 
-    def __init__(self, videos: list[tuple[str, Path]]):
+    def __init__(
+        self,
+        videos: list[tuple[str, Path]],
+        task_prompt: str = "",
+        episode_idx: int = 0,
+    ):
         import cv2
 
         self._cv2 = cv2
+        self.task_prompt = (task_prompt or "").strip()
+        self.episode_idx = episode_idx
         self.caps: list[tuple[str, Any]] = []
         for key, path in videos:
             cap = cv2.VideoCapture(str(path))
@@ -332,12 +374,66 @@ class EpisodeVideoPreview:
         if not self.caps:
             raise RuntimeError("No playable episode videos found")
 
+        if self.task_prompt:
+            print(f"[ReplayReal] Task prompt: {self.task_prompt}")
+
         cv2.namedWindow(self.WINDOW_NAME, cv2.WINDOW_NORMAL)
         cv2.resizeWindow(self.WINDOW_NAME, 1280, 480)
 
+    def _draw_overlay(self, canvas: Any, frame_idx: int) -> None:
+        """Draw frame index + task-prompt on the concatenated preview canvas."""
+        self._cv2.putText(
+            canvas,
+            f"ep{self.episode_idx}  #{frame_idx}",
+            (12, 28),
+            self._cv2.FONT_HERSHEY_SIMPLEX,
+            0.75,
+            (0, 255, 0),
+            2,
+            self._cv2.LINE_AA,
+        )
+        if not self.task_prompt:
+            return
+
+        # Wrap long prompts to fit canvas width.
+        max_chars = max(24, canvas.shape[1] // 11)
+        text = self.task_prompt
+        lines = []
+        while text:
+            lines.append(text[:max_chars])
+            text = text[max_chars:]
+            if len(lines) >= 3:
+                if text:
+                    lines[-1] = lines[-1][:-3] + "..."
+                break
+
+        y0 = 58
+        for i, line in enumerate(lines):
+            y = y0 + i * 28
+            # Dark outline for readability on bright frames.
+            self._cv2.putText(
+                canvas,
+                line,
+                (12, y),
+                self._cv2.FONT_HERSHEY_SIMPLEX,
+                0.7,
+                (0, 0, 0),
+                4,
+                self._cv2.LINE_AA,
+            )
+            self._cv2.putText(
+                canvas,
+                line,
+                (12, y),
+                self._cv2.FONT_HERSHEY_SIMPLEX,
+                0.7,
+                (0, 255, 255),
+                2,
+                self._cv2.LINE_AA,
+            )
+
     def show_frame(self, frame_idx: int) -> None:
         frames = []
-        labels = []
         for key, cap in self.caps:
             ok, frame = cap.read()
             if not ok or frame is None:
@@ -345,16 +441,15 @@ class EpisodeVideoPreview:
             label = key.rsplit(".", 1)[-1]
             self._cv2.putText(
                 frame,
-                f"{label}  #{frame_idx}",
-                (12, 28),
+                label,
+                (12, frame.shape[0] - 16),
                 self._cv2.FONT_HERSHEY_SIMPLEX,
-                0.7,
+                0.6,
                 (0, 255, 0),
                 2,
                 self._cv2.LINE_AA,
             )
             frames.append(frame)
-            labels.append(label)
 
         if not frames:
             return
@@ -369,6 +464,7 @@ class EpisodeVideoPreview:
                 f = self._cv2.resize(f, (w, h))
             resized.append(f)
         canvas = np.concatenate(resized, axis=1) if len(resized) > 1 else resized[0]
+        self._draw_overlay(canvas, frame_idx)
         self._cv2.imshow(self.WINDOW_NAME, canvas)
         self._cv2.waitKey(1)
 
@@ -638,13 +734,20 @@ class ReplayReal:
 
         if self.show_video:
             videos = resolve_episode_videos(data_dir, episode_idx)
+            task_prompt = resolve_episode_task_prompt(data_dir, episode_idx)
             if videos:
                 try:
-                    self.video_preview = EpisodeVideoPreview(videos)
+                    self.video_preview = EpisodeVideoPreview(
+                        videos,
+                        task_prompt=task_prompt,
+                        episode_idx=episode_idx,
+                    )
                 except Exception as exc:
                     print(f"[ReplayReal] Video preview disabled: {exc}")
             else:
                 print("[ReplayReal] No episode videos found; continuing without preview")
+                if task_prompt:
+                    print(f"[ReplayReal] Task prompt: {task_prompt}")
 
         # Signal handling
         signal.signal(signal.SIGINT, self._signal_handler)

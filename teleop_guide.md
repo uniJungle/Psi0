@@ -96,7 +96,7 @@ bash ./real/SONIC/scripts/collect_psi0-sonic-data-manual.sh deploy
 
 ```bash
 bash ./real/SONIC/scripts/collect_psi0-sonic-data-manual.sh pico \
-    --eef none \
+    --eef brainco \
     --dds-interface enp4s0
 ```
 
@@ -107,11 +107,11 @@ bash ./real/SONIC/scripts/collect_psi0-sonic-data-manual.sh pico \
 ```bash
 # 双目：ego_view_left / ego_view_right
 bash ./real/SONIC/scripts/collect_psi0-sonic-data-manual.sh exporter \
-    --task-prompt "Pick bottle and pour into cup." \
-    --task-name "tpose_halt" \
-    --root-output-dir /home/karthus_chen/ycb_ws/datasets/SONIC/test/ \
+    --task-prompt "Go to the table, pick up the apple, place the apple on the pink plate." \
+    --task-name "walk_to_table_and_place_apple_on_pink_plate" \
+    --root-output-dir /home/karthus_chen/ycb_ws/datasets/SONIC/ \
     --use-stereo-camera \
-    --eef none
+    --eef brainco
 
 # 单目：ego_view 选择 --use-mono-camera
 ```
@@ -175,27 +175,39 @@ python scripts/replay/replay_real.py \
   --input_type zmq_manager \
   --dds-interface enp4s0 \
   --zmq_port 5556 \
-  --eef none \
+  --eef brainco \
   --mode token \
-  --data_dir /home/karthus_chen/ycb_ws/datasets/SONIC/test/tpose_halt/2026-07-26 \
-  --episode_idx 0
+  --data_dir /home/karthus_chen/ycb_ws/datasets/SONIC/walk_to_table_and_place_apple_on_pink_plate \
+  --episode_idx 39
+```
+
+回放时会打开 `Replay Video` 窗口，叠加显示当前 episode 的 frame index，以及 `meta/episodes.jsonl` 中保存的 task-prompt。不需要画面时加 `--no-video`。
+
+查看哪些 episode 被标记为 discard（读 `meta/info.json` 的 `discarded_episode_indices`）：
+
+```bash
+cd ~/ycb_ws/Psi0/
+source .venv-psi/bin/activate
+
+python scripts/replay/list_discarded_episodes.py \
+  --data_dir /home/karthus_chen/ycb_ws/datasets/SONIC/walk_to_table_and_place_apple_on_pink_plate/data
 ```
 
 ## 数据后处理
 
-采数完成后，按以下顺序做后处理：
+### 1. 检查丢弃数据
 
-```text
+采数完成后，查看哪些 episode 被标记为 discard（读 `meta/info.json` 的 `discarded_episode_indices`）
+
+```bash
 cd ~/ycb_ws/Psi0/
+source .venv-psi/bin/activate
 
-原始 SONIC LeRobot 数据集
-  → ① 清洗（剔除 discarded episode；可选剔除无效 SMPL 帧）
-  → ② 转换为 Ψ₀ LeRobot 格式
-  → ③ 重新计算 stats
-  → ④ 准备 stats_psi0.json → 可开始微调
+python scripts/replay/list_discarded_episodes.py \
+  --data_dir /home/karthus_chen/ycb_ws/datasets/SONIC/walk_to_table_and_place_apple_on_pink_plate/data
 ```
 
-### 1. 清洗原始数据集
+### 2. 清洗原始数据集
 
 1. 按 `meta/info.json` 的 `discarded_episode_indices` 整段删除 discarded episode（parquet + 视频），并去掉该字段
 2. （默认开启）删除 无效帧：`teleop.smpl_pose` 全零的 stale 帧，及其前的冻结前导帧；有效帧上的 SMPL 原样保留
@@ -216,20 +228,11 @@ python gear_sonic/scripts/process_dataset.py \
 详细处理逻辑与全部参数说明见 [`process_dataset.py`](third_party/GR00T-WholeBodyControl/gear_sonic/scripts/process_dataset.py)。
 
 
-### 2. 转换为 Ψ₀ LeRobot 格式
+### 3. 转换为 Ψ₀ LeRobot 格式
 
 ```bash
 cd /home/karthus_chen/ycb_ws/Psi0/
 source .venv-psi/bin/activate
-
-# 单目：ego_view → egocentric
-python scripts/data/raw_sonic_to_psi_lerobot.py \
-    --data-root=/home/karthus_chen/ycb_ws/datasets/SONIC/test/2026-07-22/clean \
-    --work-dir=/home/karthus_chen/ycb_ws/datasets/SONIC/test/2026-07-22/ \
-    --repo-id=lerobot_v2.1 \
-    --robot-type=g1 \
-    --use-mono-camera \
-    --eef brainco
 
 # 双目：ego_view_left/right → egocentric_left/right
 python scripts/data/raw_sonic_to_psi_lerobot.py \
@@ -238,10 +241,13 @@ python scripts/data/raw_sonic_to_psi_lerobot.py \
     --repo-id=lerobot_v2.1 \
     --robot-type=g1 \
     --use-stereo-camera \
-    --eef brainco
+
+# 单目：ego_view → egocentric
+# --use-mono-camera
+
 ```
 
-### 3. 重新计算 stats
+### 4. 重新计算 stats
 
 ```bash
 python scripts/data/calc_modality_stats.py \
