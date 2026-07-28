@@ -90,6 +90,8 @@ Brainco 灵巧手在 SONIC 数采中的安装、通信机制与依赖说明见�
 
 ```bash
 bash ./real/SONIC/scripts/collect_psi0-sonic-data-manual.sh deploy
+
+# 低延迟模式 --low-latency
 ```
 
 ### 3. 启动 PICO 遥操作系统
@@ -111,6 +113,7 @@ bash ./real/SONIC/scripts/collect_psi0-sonic-data-manual.sh exporter \
     --task-name "walk_to_table_and_place_apple_on_pink_plate" \
     --root-output-dir /home/karthus_chen/ycb_ws/datasets/SONIC/ \
     --use-stereo-camera \
+    --dds-interface enp4s0 \
     --eef brainco
 
 # 单目：ego_view 选择 --use-mono-camera
@@ -144,30 +147,24 @@ bash ./real/SONIC/scripts/collect_psi0-sonic-data-manual.sh exporter \
     - 意外断连后系统会自动切换回规划模式（IDLE）
     - 串流/进程恢复后可正常使用 **A+X** 切换模式
 
-## 真机回放数据
+## 数据回放
 
 使用采数同款控制器（`--input-type zmq_manager`）。回放脚本会 PUB bind `tcp://*:5556`，C++ 默认 `--zmq-host localhost` SUB connect；两端都在工作站跑。
 
-### 1. 启动 SONIC C++ 控制器
+### 1. 真机数据回放
+
 ```bash
-# 等到 Init Done / [ZMQManager] Host: localhost:5556
+# 终端 1：启动 C++ deploy 的 sim 模式
 cd ~/ycb_ws/Psi0/
 bash ./real/SONIC/scripts/collect_psi0-sonic-data-manual.sh deploy
-```
 
-### 2. 进入规划模式保持 IDLE 模式
-
-```bash
-# 站稳后自动退出并释放 5556
-# 默认：start+planner → idle 约 3s → 释放 PUB（不发 stop）→ 进程退出
+# 终端 2：进入规划模式保持 IDLE 模式
 cd ~/ycb_ws/Psi0/
 source .venv-psi/bin/activate
 
 python scripts/replay/enable_control.py
-```
 
-### 3. 真机数据回放
-```bash
+# 终端 3：发送回放
 cd ~/ycb_ws/Psi0/
 source .venv-psi/bin/activate
 
@@ -179,18 +176,6 @@ python scripts/replay/replay_real.py \
   --mode token \
   --data_dir /home/karthus_chen/ycb_ws/datasets/SONIC/walk_to_table_and_place_apple_on_pink_plate \
   --episode_idx 39
-```
-
-回放时会打开 `Replay Video` 窗口，叠加显示当前 episode 的 frame index，以及 `meta/episodes.jsonl` 中保存的 task-prompt。不需要画面时加 `--no-video`。
-
-查看哪些 episode 被标记为 discard（读 `meta/info.json` 的 `discarded_episode_indices`）：
-
-```bash
-cd ~/ycb_ws/Psi0/
-source .venv-psi/bin/activate
-
-python scripts/replay/list_discarded_episodes.py \
-  --data_dir /home/karthus_chen/ycb_ws/datasets/SONIC/walk_to_table_and_place_apple_on_pink_plate/data
 ```
 
 ## 数据后处理
@@ -219,8 +204,8 @@ cd /home/karthus_chen/ycb_ws/Psi0/third_party/GR00T-WholeBodyControl
 source .venv_data_collection/bin/activate
 
 python gear_sonic/scripts/process_dataset.py \
-    --dataset-path /home/karthus_chen/ycb_ws/datasets/SONIC/test/2026-07-22/origin \
-    --output-path /home/karthus_chen/ycb_ws/datasets/SONIC/test/2026-07-22/clean \
+    --dataset-path /home/karthus_chen/ycb_ws/datasets/SONIC/walk_to_table_and_place_apple_on_pink_plate/origin \
+    --output-path /home/karthus_chen/ycb_ws/datasets/SONIC/walk_to_table_and_place_apple_on_pink_plate/clean \
     --remove-discarded \
     --remove-stale-smpl
 ```
@@ -236,23 +221,22 @@ source .venv-psi/bin/activate
 
 # 双目：ego_view_left/right → egocentric_left/right
 python scripts/data/raw_sonic_to_psi_lerobot.py \
-    --data-root=/home/karthus_chen/ycb_ws/datasets/SONIC/test/2026-07-22/clean \
-    --work-dir=/home/karthus_chen/ycb_ws/datasets/SONIC/test/2026-07-22/ \
-    --repo-id=lerobot_v2.1 \
-    --robot-type=g1 \
-    --use-stereo-camera \
+  --data-root=/home/karthus_chen/ycb_ws/datasets/SONIC/walk_to_table_and_place_apple_on_pink_plate/clean \
+  --work-dir=/home/karthus_chen/ycb_ws/datasets/SONIC/walk_to_table_and_place_apple_on_pink_plate/ \
+  --repo-id=lerobot_v2.1 \
+  --robot-type=g1 \
+  --eef brainco \
+  --use-stereo-camera
 
 # 单目：ego_view → egocentric
 # --use-mono-camera
-
 ```
 
 ### 4. 重新计算 stats
 
 ```bash
 python scripts/data/calc_modality_stats.py \
-    --work-dir=/home/karthus_chen/ycb_ws/datasets/SONIC/test/2026-07-22/ \
-    --task=lerobot_v2.1
+  --task-dir=/home/karthus_chen/ycb_ws/datasets/SONIC/walk_to_table_and_place_apple_on_pink_plate/lerobot_v2.1
 ```
 
 ### 4. 生成 Ψ₀ 训练用 stats 副本

@@ -163,27 +163,27 @@ def extract_action_token(frame: dict[str, Any]) -> tuple[np.ndarray, np.ndarray,
     Extract motion token and hand joints from a dataset frame.
 
     Returns:
-        motion_token: (64D) motion token from action.motion_token
-        left_hand: (7D) left hand joints
-        right_hand: (7D) right hand joints
+        motion_token: (64D) motion token from action.motion_token, or action[:64]
+        left_hand: (7D) left hand joints (zeroed when source is Psi0 action[68])
+        right_hand: (7D) right hand joints (zeroed when source is Psi0 action[68])
     """
-    motion_token = frame["action.motion_token"]
+    motion_token = frame.get("action.motion_token")
+    if motion_token is None:
+        motion_token = frame.get("action")
+        if motion_token is None:
+            raise KeyError("Expected 'action.motion_token' or 'action' in frame")
     if hasattr(motion_token, 'numpy'):
         motion_token = motion_token.numpy()
     else:
         motion_token = np.asarray(motion_token)
+    motion_token = np.asarray(motion_token).reshape(-1)
+    if motion_token.size < 64:
+        raise ValueError(f"Expected token/action dim >= 64, got {motion_token.size}")
+    motion_token = motion_token[:64]
 
-    left_hand = frame["teleop.left_hand_joints"]
-    if hasattr(left_hand, 'numpy'):
-        left_hand = left_hand.numpy()
-    else:
-        left_hand = np.asarray(left_hand)
-
-    right_hand = frame["teleop.right_hand_joints"]
-    if hasattr(right_hand, 'numpy'):
-        right_hand = right_hand.numpy()
-    else:
-        right_hand = np.asarray(right_hand)
+    # Token replay in sim ignores EEF. If raw teleop hand joints exist, also ignore them.
+    left_hand = np.zeros(7, dtype=np.float32)
+    right_hand = np.zeros(7, dtype=np.float32)
 
     return motion_token, left_hand, right_hand
 

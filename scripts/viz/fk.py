@@ -95,10 +95,12 @@ class G1FK:
             jid = self.model.getJointId(parent_joint)
             if jid == 0:
                 raise ValueError(f"Joint not found: {parent_joint}")
+            parent_fid = self.model.getFrameId(parent_joint)
             self.model.addFrame(
                 pin.Frame(
                     frame_name,
                     jid,
+                    parent_fid,
                     pin.SE3(
                         np.eye(3),
                         np.array(offset, dtype=float).reshape(

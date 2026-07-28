@@ -10,9 +10,9 @@
 #   bash ./real/SONIC/scripts/collect_psi0-sonic-data-manual.sh exporter \
 #       --use-stereo-camera                                               # 3) data exporter (records)
 #
-# PICO options (defaults: Brainco on enx6c1ff7c12485):
+# PICO options (defaults: Brainco on enp4s0):
 #   bash ./real/SONIC/scripts/collect_psi0-sonic-data-manual.sh pico \
-#       --eef brainco --dds-interface enx6c1ff7c12485
+#       --eef brainco --dds-interface enp4s0
 #   bash ./real/SONIC/scripts/collect_psi0-sonic-data-manual.sh pico --eef none
 #
 # Exporter camera (required; mutually exclusive):
@@ -32,7 +32,7 @@ TASK_NAME="pick_bottle"
 FPS=30
 OUTPUT_DIR="$PSI0_ROOT/outputs/SONIC"
 EEF="brainco"
-DDS_INTERFACE="enx6c1ff7c12485"
+DDS_INTERFACE="enp4s0"
 CAMERA_MODE=""  # stereo | mono
 LOW_LATENCY=false
 
@@ -46,7 +46,7 @@ Options:
   --task-name NAME
   --root-output-dir DIR
   --eef {none|brainco|dex3}     (pico: none|brainco; exporter: dex3|brainco; default: brainco)
-  --dds-interface IFACE         (pico/exporter; default: enx6c1ff7c12485)
+  --dds-interface IFACE         (pico/exporter; default: enp4s0)
   --use-stereo-camera           (exporter; stereo ego_view_left/right)
   --use-mono-camera             (exporter; mono ego_view)"
 

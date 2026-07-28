@@ -651,6 +651,7 @@ class ReplayReal:
         eef: str = "auto",
         dds_interface: str = "enp4s0",
         show_video: bool = True,
+        no_robot: bool = False,
     ):
         """
         Args:
@@ -665,6 +666,7 @@ class ReplayReal:
             eef: "auto" (2D hand joints → brainco), "none", or "brainco"
             dds_interface: NIC for Brainco DDS
             show_video: Open OpenCV window with episode ego videos
+            no_robot: Preview-only mode; skip ZMQ / DDS and ignore eef
         """
         self.data_dir = data_dir
         self.episode_idx = episode_idx
@@ -678,10 +680,12 @@ class ReplayReal:
         self.eef = eef
         self.dds_interface = dds_interface
         self.show_video = show_video
+        self.no_robot = no_robot
         self.running = True
         self._handoff_done = False
         self.brainco_hand = None
         self.video_preview: Optional[EpisodeVideoPreview] = None
+        self.zmq: Optional[ReplayZMQClient] = None
 
         # Read selected episode parquet directly (no LeRobotDataset / video preload)
         self.parquet_path = resolve_episode_parquet(data_dir, episode_idx)
@@ -706,31 +710,37 @@ class ReplayReal:
             f"(episode={episode_idx}, frames={self.num_frames})"
         )
 
-        if self.eef == "auto":
-            sample = _as_1d(self.df.iloc[0].get("teleop.left_hand_joints"), np.zeros(0))
-            self.eef = "brainco" if sample.size == 2 else "none"
-            print(
-                f"[ReplayReal] --eef auto → {self.eef} "
-                f"(teleop.left_hand_joints dim={sample.size})"
-            )
+        if self.no_robot:
+            if self.eef != "none":
+                print(f"[ReplayReal] --no-robot enabled; ignoring --eef={self.eef}")
+            self.eef = "none"
+            print("[ReplayReal] Preview-only mode: skipping robot ZMQ and Brainco DDS")
+        else:
+            if self.eef == "auto":
+                sample = _as_1d(self.df.iloc[0].get("teleop.left_hand_joints"), np.zeros(0))
+                self.eef = "brainco" if sample.size == 2 else "none"
+                print(
+                    f"[ReplayReal] --eef auto → {self.eef} "
+                    f"(teleop.left_hand_joints dim={sample.size})"
+                )
 
-        if self.eef == "brainco":
-            self.brainco_hand = create_brainco_hand(self.dds_interface)
-        elif self.eef not in ("", "none"):
-            raise ValueError(
-                f"Unsupported --eef={self.eef!r}. Use 'auto', 'none', or 'brainco'."
-            )
+            if self.eef == "brainco":
+                self.brainco_hand = create_brainco_hand(self.dds_interface)
+            elif self.eef not in ("", "none"):
+                raise ValueError(
+                    f"Unsupported --eef={self.eef!r}. Use 'auto', 'none', or 'brainco'."
+                )
 
-        # ZMQ PUB must bind on the same host that C++ --zmq-host connects to.
-        # Default deploy uses --zmq-host localhost, so bind *:5556 on this machine.
-        # (robot_ip is kept for API compatibility; ZMQ does not target the robot NIC.)
-        self.zmq = ReplayZMQClient(
-            host="*",
-            port=zmq_port,
-            mode=mode,
-            input_type=input_type,
-        )
-        self.zmq.connect()
+            # ZMQ PUB must bind on the same host that C++ --zmq-host connects to.
+            # Default deploy uses --zmq-host localhost, so bind *:5556 on this machine.
+            # (robot_ip is kept for API compatibility; ZMQ does not target the robot NIC.)
+            self.zmq = ReplayZMQClient(
+                host="*",
+                port=zmq_port,
+                mode=mode,
+                input_type=input_type,
+            )
+            self.zmq.connect()
 
         if self.show_video:
             videos = resolve_episode_videos(data_dir, episode_idx)
@@ -763,7 +773,12 @@ class ReplayReal:
             return
         self._handoff_done = True
 
-        if self.zmq.sock is None:
+        if self.zmq is None or self.zmq.sock is None:
+            shutdown_brainco_hand(self.brainco_hand)
+            self.brainco_hand = None
+            if self.video_preview is not None:
+                self.video_preview.close()
+                self.video_preview = None
             return
 
         if self.stop_on_exit:
@@ -804,22 +819,25 @@ class ReplayReal:
             print("[ReplayReal] Brainco hand replay enabled (DDS 2D targets)")
         if self.video_preview is not None:
             print("[ReplayReal] Video preview window: 'Replay Video' (synced to frame index)")
+        if self.no_robot:
+            print("[ReplayReal] --no-robot: local preview only, no commands will be sent")
 
-        # ZMQManager only processes `start` while in PLANNER mode. Sending
-        # start=True with planner=False immediately jumps to STREAMED_MOTION and
-        # drops the start handshake → C++ stays in WAIT_FOR_CONTROL (tokens
-        # arrive/log but motors never engage). Match pico_manager / RTC client:
-        #   1) start + planner=True  → enter CONTROL
-        #   2) start + planner=False → STREAMED_MOTION (token / pose topic)
-        #   3) stream pose frames
-        print("[ReplayReal] Step 1/2: start control in PLANNER mode...")
-        self.zmq.send_command(start=True, stop=False, planner=True)
-        time.sleep(max(self.warmup_seconds, 2.0))
+        if not self.no_robot:
+            # ZMQManager only processes `start` while in PLANNER mode. Sending
+            # start=True with planner=False immediately jumps to STREAMED_MOTION and
+            # drops the start handshake → C++ stays in WAIT_FOR_CONTROL (tokens
+            # arrive/log but motors never engage). Match pico_manager / RTC client:
+            #   1) start + planner=True  → enter CONTROL
+            #   2) start + planner=False → STREAMED_MOTION (token / pose topic)
+            #   3) stream pose frames
+            print("[ReplayReal] Step 1/2: start control in PLANNER mode...")
+            self.zmq.send_command(start=True, stop=False, planner=True)
+            time.sleep(max(self.warmup_seconds, 2.0))
 
-        if self.mode == "token":
-            print("[ReplayReal] Step 2/2: switch to STREAMED_MOTION (pose/token)...")
-            self.zmq.send_command(start=True, stop=False, planner=False)
-            time.sleep(1.0)
+            if self.mode == "token":
+                print("[ReplayReal] Step 2/2: switch to STREAMED_MOTION (pose/token)...")
+                self.zmq.send_command(start=True, stop=False, planner=False)
+                time.sleep(1.0)
 
         try:
             frame_idx = 0
@@ -828,12 +846,13 @@ class ReplayReal:
             while self.running and frame_idx < self.num_frames:
                 frame = row_to_frame(self.df.iloc[frame_idx])
 
-                if self.mode == "token":
-                    motion_token, left_hand, right_hand = extract_action_token(frame)
-                    self.zmq.send_token(motion_token, left_hand, right_hand)
-                else:
-                    action = extract_action_joints(frame)
-                    self.zmq.send_action(action)
+                if not self.no_robot:
+                    if self.mode == "token":
+                        motion_token, left_hand, right_hand = extract_action_token(frame)
+                        self.zmq.send_token(motion_token, left_hand, right_hand)
+                    else:
+                        action = extract_action_joints(frame)
+                        self.zmq.send_action(action)
 
                 if self.brainco_hand is not None:
                     left_2d, right_2d = extract_brainco_2d(frame)
@@ -957,6 +976,11 @@ Input type:
         action="store_true",
         help="Disable OpenCV episode video preview window",
     )
+    parser.add_argument(
+        "--no-robot",
+        action="store_true",
+        help="Preview only: skip ZMQ / DDS and ignore --eef",
+    )
 
     args = parser.parse_args()
 
@@ -975,6 +999,7 @@ Input type:
         eef=args.eef,
         dds_interface=args.dds_interface,
         show_video=not args.no_video,
+        no_robot=args.no_robot,
     )
     try:
         replay.run()

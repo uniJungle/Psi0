@@ -47,6 +47,8 @@ def main() -> None:
     with open(info_path, "r", encoding="utf-8") as f:
         info = json.load(f)
 
+    data_dir = dataset_dir / "data"
+    total_episode_files = len(list(data_dir.glob("chunk-*/episode_*.parquet")))
     discarded = sorted(int(x) for x in info.get("discarded_episode_indices", []))
     data_tpl = info.get("data_path", "data/chunk-{episode_chunk:03d}/episode_{episode_index:06d}.parquet")
     chunk_size = int(info.get("chunks_size", 1000))
@@ -69,6 +71,7 @@ def main() -> None:
             json.dumps(
                 {
                     "dataset_dir": str(dataset_dir),
+                    "total_episode_files": total_episode_files,
                     "discarded_count": len(discarded),
                     "discarded_episode_indices": discarded,
                     "files": details,
@@ -79,17 +82,9 @@ def main() -> None:
         )
         return
 
-    print(f"Dataset: {dataset_dir}")
-    print(f"Discarded episodes: {len(discarded)}")
-    if not discarded:
-        return
-
-    print("Indices:")
-    print(" ".join(str(i) for i in discarded))
-    print("\nFiles:")
-    for item in details:
-        mark = "OK" if item["exists"] else "MISSING"
-        print(f"  [{mark}] ep{item['episode_index']:06d} -> {item['relative_path']}")
+    print(f"总条数: {total_episode_files}")
+    print(f"discard 数量: {len(discarded)}")
+    print(f"discard index: {' '.join(str(i) for i in discarded) if discarded else '(none)'}")
 
 
 if __name__ == "__main__":
