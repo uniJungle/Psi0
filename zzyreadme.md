@@ -473,7 +473,7 @@ deploy --input-type zmq_manager
 
 推荐用采数同款控制器（`--input-type zmq_manager`）。回放脚本会 **PUB bind** `tcp://*:5556`，C++ 默认 `--zmq-host localhost` SUB connect；两端都在工作站跑。
 
-#### 方式一：先启用控制，再回放（推荐）
+#### 先启用控制，再回放（推荐）
 
 ```bash
 # 1) 工作站：启动 deploy
@@ -481,43 +481,39 @@ bash ./real/SONIC/scripts/collect_psi0-sonic-data-manual.sh deploy
 # 等到 Init Done / [ZMQManager] Host: localhost:5556
 
 # 2) 另开终端：站稳后自动退出并释放 5556（不要用 --hold 一直占着端口）
+source .venv-psi/bin/activate
 python scripts/replay/enable_control.py
 # 默认：start+planner → idle 约 3s → 释放 PUB（不发 stop）→ 进程退出
 # 机器人仍停在 PLANNER/CONTROL，端口已空给回放
 
 # 3) 同一机器回放（必须 bind 5556，不要用 5559）
 python scripts/replay/replay_real.py \
-  --mode token \
-  --episode_idx 0 \
   --input_type zmq_manager \
+  --dds-interface enp4s0 \
   --zmq_port 5556 \
-  --data_dir /home/karthus_chen/ycb_ws/datasets/SONIC/no_halt
+  --eef none \
+  --mode token \
+  --data_dir /home/karthus_chen/ycb_ws/datasets/SONIC/test/tpose_halt/2026-07-26 \
+  --episode_idx 0
 ```
 
-#### 方式二：一条命令启动 deploy + 自动控制
+但是每次数据回放完，没法用键盘控制机器人让他走回原来位置，也没办法直接切换下一条或重播当前数据，只能重新运行该脚本，手动修改episode.
 
+优化思路：
+
+首先是在官方流程中：
 ```bash
-# 启动 deploy，等 5 秒后站稳并释放端口（随后再开终端跑 replay）
-(bash ./real/SONIC/scripts/collect_psi0-sonic-data-manual.sh deploy &) && sleep 5 && python scripts/replay/enable_control.py
+# From gear_sonic_deploy/
+bash deploy.sh --input-type keyboard real
 ```
+可以直接通过键盘控制真机，当然他这个是一键启动脚本，我只想用到其中用键盘控制真机的部分逻辑。
 
-> **说明**：
-> - `enable_control.py` 与 `replay_real.py` **不能同时** bind `tcp://*:5556`。
-> - 旧版 `enable_control` 会一直发 idle planner，把回放切到的 `STREAMED_MOTION` 顶回规划；现已改为默认 **handoff**：站稳后退出并释放端口（不发 `stop`）。
-> - 若需要长时间保持站立再手动开回放：`python scripts/replay/enable_control.py --hold`，**先 Ctrl+C 释放端口**，再跑 `replay_real.py`。
-> - 回放默认端口已改为 `5556`；若仍指定 `--zmq_port 5559`，deploy（听 5556）收不到指令。
-> - 回放结束后脚本会**切回 idle PLANNER 并释放 5556**（不发 `stop`），**deploy 继续运行**；不要再用旧版 `stop=True` 退出。
+也就是说，我当前的回放是：回放数据--完成后切到idle_planner，代码退出。
 
-成功时 deploy 端应依次出现：
-- `[ZMQManager] Planner enabled` / `motion name is planner_motion`
-- `[Control] ... transitioning to CONTROL state`
-- `[ZMQManager] Switched to: STREAMED MOTION` / `ZMQ STREAMING MODE: ENABLED`
-- `[ZMQEndpointInterface] Protocol v4: Received 64D token ...`
+我需要的新的逻辑是：启动代码后此时可以用键盘控制，可以按 1 在 slow walk 和 idle planner之间切换，在slow walk时可以按wasd控制，在idle_planner中可以按qe转方向，这个就用他自带的，我只不过仅需要两个模式--按enter回放当前条数据--完成后切到idle_planner--然后可以键盘控制--此时按 enter 可以重播当前数据，按右箭头可以跳到下一条数据，左箭头可以回到上一条数据，再按enter可以播放--ctrlc/esc退出时切回idle planner程序再结束。
 
-注意：
-- 不要用 `deploy_psi0-sonic-rtc-robot.sh`（默认 `input-type=manager` / InterfaceManager，默认 KEYBOARD）做 token 回放。
-- 不要边开 pico 边回放（pico 也会 bind 5556，端口冲突）。
-- 若只看到 token 日志但机器人不动，多半是 `start` 握手失败（必须先 `planner=True` 再切 streamed）；当前 `replay_real.py` 已按该顺序发送。
+
+
 
 ## 5.4 暂停恢复逻辑
 

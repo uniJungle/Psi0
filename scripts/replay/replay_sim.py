@@ -22,13 +22,18 @@ ZMQ Protocol:
 
 from __future__ import annotations
 
+import math
 import os
+import queue
 import sys
+import termios
+import threading
 import time
 import signal
 import argparse
+from enum import Enum
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 import numpy as np
 
@@ -229,9 +234,11 @@ class ReplayZMQClient:
         import zmq
         self.ctx = zmq.Context()
         self.sock = self.ctx.socket(zmq.PUB)
-        self.sock.bind(f"tcp://{self.host}:{self.port}")
+        # Bind to all interfaces for simulation (C++ WBC connects via localhost)
+        bind_host = self.host if self.host not in ("localhost", "127.0.0.1") else "*"
+        self.sock.bind(f"tcp://{bind_host}:{self.port}")
         time.sleep(0.5)
-        print(f"[ReplayZMQ] Bound to tcp://{self.host}:{self.port}, mode={self.mode}")
+        print(f"[ReplayZMQ] Bound to tcp://{bind_host}:{self.port}, mode={self.mode}")
 
     def send_command(self, start: bool = False, stop: bool = False, planner: bool = True):
         """Send control command (start/stop/planner mode)."""
@@ -429,21 +436,514 @@ class ReplaySim:
         print("[ReplaySim] Shutting down...")
 
 
+# ---------------- Keyboard Controller ----------------
+
+
+class KeyboardController:
+    """Terminal keyboard input listener (non-blocking, independent thread)."""
+
+    # ANSI escape codes for special keys
+    ESC = "\x1b"
+    ARROW_UP = ESC + "[A"
+    ARROW_DOWN = ESC + "[B"
+    ARROW_RIGHT = ESC + "[C"
+    ARROW_LEFT = ESC + "[D"
+    ENTER = "\n"
+
+    def __init__(self):
+        self._running = True
+        self._key_queue: queue.Queue[Optional[str]] = queue.Queue()
+        self._thread: Optional[threading.Thread] = None
+        self._original_termios: Optional[tuple] = None
+
+    def _setup_terminal(self):
+        """Set terminal to non-canonical, non-blocking mode."""
+        self._original_termios = termios.tcgetattr(sys.stdin)
+        new_attrs = termios.tcgetattr(sys.stdin)
+        # ECHO: don't echo input
+        # ICANON: non-canonical mode (no line buffering)
+        # ISIG: don't generate SIGINT on ctrl-c
+        new_attrs[3] = new_attrs[3] & ~(termios.ECHO | termios.ICANON | termios.ISIG)
+        new_attrs[6][termios.VMIN] = 0  # non-blocking read
+        new_attrs[6][termios.VTIME] = 0
+        termios.tcsetattr(sys.stdin, termios.TCSANOW, new_attrs)
+
+    def _restore_terminal(self):
+        """Restore original terminal settings."""
+        if self._original_termios is not None:
+            termios.tcsetattr(sys.stdin, termios.TCSANOW, self._original_termios)
+
+    def _read_loop(self):
+        """Background thread that reads keyboard input."""
+        while self._running:
+            try:
+                ch = sys.stdin.read(1)
+                if ch:
+                    # Handle escape sequences (arrow keys, etc.)
+                    if ch == self.ESC:
+                        # Peek at next char to detect arrow keys
+                        import select
+                        if select.select([sys.stdin], [], [], 0.05)[0]:
+                            next_ch = sys.stdin.read(1)
+                            if next_ch == "[":
+                                if select.select([sys.stdin], [], [], 0.05)[0]:
+                                    arrow = sys.stdin.read(1)
+                                    if arrow == "A":
+                                        self._key_queue.put(self.ARROW_UP)
+                                        continue
+                                    elif arrow == "B":
+                                        self._key_queue.put(self.ARROW_DOWN)
+                                        continue
+                                    elif arrow == "C":
+                                        self._key_queue.put(self.ARROW_RIGHT)
+                                        continue
+                                    elif arrow == "D":
+                                        self._key_queue.put(self.ARROW_LEFT)
+                                        continue
+                            self._key_queue.put(self.ESC)
+                        else:
+                            self._key_queue.put(self.ESC)
+                    else:
+                        self._key_queue.put(ch)
+            except Exception:
+                break
+            time.sleep(0.01)  # Small sleep to avoid busy waiting
+
+    def start(self):
+        """Start the keyboard listener thread."""
+        self._setup_terminal()
+        self._thread = threading.Thread(target=self._read_loop, daemon=True)
+        self._thread.start()
+        print("[Keyboard] Control enabled")
+
+    def stop(self):
+        """Stop the keyboard listener and restore terminal."""
+        self._running = False
+        if self._thread:
+            self._thread.join(timeout=0.5)
+        self._restore_terminal()
+        print("[Keyboard] Control disabled")
+
+    def get_key(self) -> Optional[str]:
+        """Get the next key press (non-blocking). Returns None if no key pressed."""
+        try:
+            return self._key_queue.get_nowait()
+        except queue.Empty:
+            return None
+
+
+# ---------------- Interactive Replay Mode ----------------
+
+
+class InteractiveReplayMode(Enum):
+    IDLE_PLANER = "idle_planner"
+    SLOW_WALK = "slow_walk"
+    PLAYING = "playing"
+
+
+class InteractiveReplaySim:
+    """Interactive simulation replay with keyboard control."""
+
+    # Locomotion mode constants (from C++ enum)
+    LOCOMOTION_MODE_IDLE = 0
+    LOCOMOTION_MODE_SLOW_WALK = 2  # walking mode for keyboard control
+
+    def __init__(
+        self,
+        data_dir: str,
+        episode_idx: int = 0,
+        fps: int = 30,
+        zmq_host: str = "localhost",
+        zmq_port: int = 5556,
+        mode: str = "token",
+        slow_walk_speed: float = 0.3,
+        data_dirs: Optional[list[str]] = None,
+    ):
+        """
+        Args:
+            data_dir: Path to LeRobot dataset directory
+            episode_idx: Initial episode index
+            fps: Target replay FPS
+            zmq_host: ZMQ host
+            zmq_port: ZMQ port
+            mode: "planner" or "token"
+            slow_walk_speed: Speed for slow walk mode
+            data_dirs: Optional list of data directories for navigation
+        """
+        self.data_dir = data_dir
+        self.fps = fps
+        self.frame_duration = 1.0 / fps
+        self.mode = mode
+        self.slow_walk_speed = slow_walk_speed
+        self.data_dirs = data_dirs or [data_dir]
+
+        # State
+        self.current_mode = InteractiveReplayMode.IDLE_PLANER
+        self.current_episode_idx = episode_idx
+        self.num_episodes = 0
+        self.running = True
+        self.replay_running = False
+        self.frames: list[dict[str, Any]] = []
+        self.current_frame_idx = 0
+
+        # Facing direction for idle_planner mode (cumulative yaw)
+        self.facing_yaw = 0.0
+        self.facing_yaw_delta = math.pi / 12  # +/- 15 degrees
+
+        # Movement direction for slow_walk mode
+        self.movement = [0.0, 0.0, 0.0]
+
+        # Keyboard controller
+        self.kb = KeyboardController()
+
+        # Load all episodes metadata (just count, no frame data)
+        self._load_episodes_metadata()
+
+        # Initialize episode state (lazy load: only store metadata)
+        self.current_episode_idx = -1
+        self.episode_indices = []
+        self.episode_dataset = None  # Store dataset reference for lazy loading
+        self.episode_data_dir = None
+
+        # ZMQ client
+        from psi.data.lerobot.compat import LeRobotDataset
+        self._lerobot_dataset_class = LeRobotDataset
+        self.zmq = ReplayZMQClient(host=zmq_host, port=zmq_port, mode=mode)
+        self.zmq.connect()
+
+        # Signal handling
+        signal.signal(signal.SIGINT, self._signal_handler)
+        signal.signal(signal.SIGTERM, self._signal_handler)
+
+    def _load_episodes_metadata(self):
+        """Load metadata for all episodes across all data directories."""
+        from psi.data.lerobot.compat import LeRobotDataset
+
+        episode_count = 0
+        for data_dir in self.data_dirs:
+            data_path = Path(data_dir)
+            if not data_path.exists():
+                print(f"[InteractiveReplay] Warning: data_dir not found: {data_dir}")
+                continue
+            try:
+                repo_id = data_path.name
+                dataset = LeRobotDataset(repo_id=repo_id, root=str(data_path))
+                episode_count += dataset.num_episodes
+            except Exception as e:
+                print(f"[InteractiveReplay] Warning: failed to load {data_dir}: {e}")
+        self.num_episodes = episode_count
+        print(f"[InteractiveReplay] Total episodes available: {self.num_episodes}")
+
+    def _load_episode(self, idx: int):
+        """Load episode metadata (indices only), frames are loaded on-demand."""
+        from psi.data.lerobot.compat import LeRobotDataset
+
+        if idx < 0 or idx >= self.num_episodes:
+            print(f"[InteractiveReplay] Episode {idx} out of range (0-{self.num_episodes - 1})")
+            return False
+
+        # Find which data_dir contains this episode
+        cumulative = 0
+        for data_dir in self.data_dirs:
+            data_path = Path(data_dir)
+            if not data_path.exists():
+                continue
+            try:
+                repo_id = data_path.name
+                dataset = LeRobotDataset(repo_id=repo_id, root=str(data_path))
+                if idx < cumulative + dataset.num_episodes:
+                    local_idx = idx - cumulative
+                    episode_index = dataset.episode_data_index
+                    start_idx = episode_index["from"][local_idx].item()
+                    end_idx = episode_index["to"][local_idx].item()
+                    self.episode_indices = list(range(start_idx, end_idx))
+                    self.episode_dataset = dataset
+                    self.episode_data_dir = data_dir
+                    self.current_episode_idx = idx
+                    print(f"[InteractiveReplay] Episode {idx} ready ({len(self.episode_indices)} frames)")
+                    return True
+                cumulative += dataset.num_episodes
+            except Exception as e:
+                print(f"[InteractiveReplay] Warning: failed to load {data_dir}: {e}")
+                continue
+
+        return False
+
+    def _get_frame(self, frame_idx: int):
+        """Load a single frame on-demand from dataset."""
+        if self.episode_dataset is None:
+            return None
+        try:
+            global_idx = self.episode_indices[frame_idx]
+            frame = self.episode_dataset[global_idx]
+            frame_data = {}
+            for key, value in frame.items():
+                if hasattr(value, 'numpy'):
+                    frame_data[key] = value.numpy()
+                else:
+                    frame_data[key] = np.asarray(value)
+            return frame_data
+        except Exception as e:
+            print(f"[InteractiveReplay] Error loading frame {frame_idx}: {e}")
+            return None
+
+    def _navigate_episode(self, delta: int):
+        """Navigate to previous (delta < 0) or next (delta > 0) episode."""
+        new_idx = self.current_episode_idx + delta
+        if new_idx < 0 or new_idx >= self.num_episodes:
+            print(f"[InteractiveReplay] Episode {new_idx} out of range")
+            return
+        self._load_episode(new_idx)
+        print(f"[InteractiveReplay] Now on episode {self.current_episode_idx}")
+
+    def _signal_handler(self, sig, frame):
+        print(f"\n[InteractiveReplay] Signal {sig}, shutting down...")
+        self.running = False
+
+    def _send_start_planner(self):
+        """Send start command to enter PLANNER mode."""
+        msg = build_command_message(start=True, stop=False, planner=True)
+        self.zmq.sock.send(msg)
+        print("[InteractiveReplay] Sent: start=True, planner=True")
+
+    def _send_idle_planner(self):
+        """Send idle planner command (robot stands still, facing direction adjustable)."""
+        # Use facing vector for direction control
+        facing_x = math.cos(self.facing_yaw)
+        facing_y = math.sin(self.facing_yaw)
+        msg = build_planner_message(
+            mode=self.LOCOMOTION_MODE_IDLE,
+            movement=[0.0, 0.0, 0.0],
+            facing=[facing_x, facing_y, 0.0],
+            speed=-1.0,
+            height=-1.0,
+        )
+        self.zmq.sock.send(msg)
+
+    def _send_slow_walk(self):
+        """Send slow walk command with current movement vector."""
+        facing_x = math.cos(self.facing_yaw)
+        facing_y = math.sin(self.facing_yaw)
+        msg = build_planner_message(
+            mode=self.LOCOMOTION_MODE_SLOW_WALK,
+            movement=self.movement,
+            facing=[facing_x, facing_y, 0.0],
+            speed=self.slow_walk_speed,
+            height=-1.0,
+        )
+        self.zmq.sock.send(msg)
+
+    def _switch_to_idle_planner(self):
+        """Switch to idle planner mode."""
+        if self.current_mode != InteractiveReplayMode.IDLE_PLANER:
+            self.current_mode = InteractiveReplayMode.IDLE_PLANER
+            self.replay_running = False
+            print("[InteractiveReplay] Mode: IDLE_PLANER")
+
+    def _switch_to_slow_walk(self):
+        """Switch to slow walk mode."""
+        if self.current_mode != InteractiveReplayMode.SLOW_WALK:
+            self.current_mode = InteractiveReplayMode.SLOW_WALK
+            self.replay_running = False
+            self.movement = [0.0, 0.0, 0.0]
+            print("[InteractiveReplay] Mode: SLOW_WALK")
+
+    def _start_replay(self):
+        """Start replaying the current episode."""
+        if self.current_mode == InteractiveReplayMode.PLAYING:
+            # Stop current replay
+            self.replay_running = False
+            self.current_mode = InteractiveReplayMode.IDLE_PLANER
+            print("[InteractiveReplay] Mode: IDLE_PLANER (replay stopped)")
+        else:
+            # Lazy load: if episode not loaded yet, load metadata first
+            if self.current_episode_idx < 0 or not self.episode_indices:
+                print("[InteractiveReplay] Loading episode metadata...")
+                if not self._load_episode(0 if self.current_episode_idx < 0 else self.current_episode_idx):
+                    print("[InteractiveReplay] Failed to load episode, cannot start replay")
+                    return
+
+            # Start replay
+            self.current_mode = InteractiveReplayMode.PLAYING
+            self.replay_running = True
+            self.current_frame_idx = 0
+            print(f"[InteractiveReplay] Mode: PLAYING (episode {self.current_episode_idx}, {len(self.episode_indices)} frames)")
+
+    def _handle_keyboard_input(self, key: Optional[str]):
+        """Process keyboard input."""
+        if key is None:
+            return
+
+        if key == "1":
+            # Toggle between IDLE_PLANER and SLOW_WALK
+            if self.current_mode == InteractiveReplayMode.IDLE_PLANER:
+                self._switch_to_slow_walk()
+            elif self.current_mode == InteractiveReplayMode.SLOW_WALK:
+                self._switch_to_idle_planner()
+            elif self.current_mode == InteractiveReplayMode.PLAYING:
+                # Stop replay first, then toggle
+                self._start_replay()
+
+        elif key == KeyboardController.ENTER:
+            self._start_replay()
+
+        elif key == KeyboardController.ARROW_UP:
+            self._navigate_episode(-1)
+
+        elif key == KeyboardController.ARROW_DOWN:
+            self._navigate_episode(1)
+
+        elif key == "q" or key == "Q":
+            if self.current_mode == InteractiveReplayMode.IDLE_PLANER:
+                self.facing_yaw -= self.facing_yaw_delta
+                print(f"[InteractiveReplay] Facing: {math.degrees(self.facing_yaw):.1f} deg")
+
+        elif key == "e" or key == "E":
+            if self.current_mode == InteractiveReplayMode.IDLE_PLANER:
+                self.facing_yaw += self.facing_yaw_delta
+                print(f"[InteractiveReplay] Facing: {math.degrees(self.facing_yaw):.1f} deg")
+
+        elif key in ("w", "W", "a", "A", "s", "S", "d", "D"):
+            if self.current_mode == InteractiveReplayMode.SLOW_WALK:
+                # WASD for movement (relative to facing direction)
+                forward = 0.0
+                strafe = 0.0
+                if key in ("w", "W"):
+                    forward = 1.0
+                elif key in ("s", "S"):
+                    forward = -1.0
+                elif key in ("a", "A"):
+                    strafe = -1.0
+                elif key in ("d", "D"):
+                    strafe = 1.0
+                # Movement is relative to facing direction
+                self.movement = [forward, strafe, 0.0]
+
+        elif key == KeyboardController.ESC or key == "\x03":  # Ctrl+C
+            print("[InteractiveReplay] Quit requested")
+            self.running = False
+
+    def _print_help(self):
+        """Print keyboard control help."""
+        print("\n" + "=" * 50)
+        print("Interactive Replay Controls:")
+        print("=" * 50)
+        print("  1          - Toggle IDLE_PLANER / SLOW_WALK mode")
+        print("  W/A/S/D    - Move (in SLOW_WALK mode)")
+        print("  Q / E      - Turn left/right (in IDLE_PLANER mode)")
+        print("  Up/Down    - Previous/Next episode")
+        print("  Enter      - Play/Stop current episode")
+        print("  Ctrl+C     - Exit")
+        print("=" * 50 + "\n")
+
+    def run(self):
+        """Main interactive loop."""
+        print(f"[InteractiveReplay] Starting interactive replay, mode={self.mode}")
+        print(f"[InteractiveReplay] Total episodes: {self.num_episodes}")
+        self._print_help()
+
+        # Start keyboard listener
+        self.kb.start()
+
+        # Send initial start command
+        self._send_start_planner()
+        time.sleep(1.0)
+
+        # Switch to idle planner mode
+        self._switch_to_idle_planner()
+
+        prev_time = time.perf_counter()
+        control_rate = 30.0  # Hz for control commands
+        control_interval = 1.0 / control_rate
+
+        try:
+            while self.running:
+                # Process keyboard input
+                key = self.kb.get_key()
+                while key is not None:
+                    self._handle_keyboard_input(key)
+                    if not self.running:
+                        break
+                    key = self.kb.get_key()
+
+                if not self.running:
+                    break
+
+                # Send control commands based on mode
+                if self.current_mode == InteractiveReplayMode.IDLE_PLANER:
+                    self._send_idle_planner()
+                elif self.current_mode == InteractiveReplayMode.SLOW_WALK:
+                    self._send_slow_walk()
+                elif self.current_mode == InteractiveReplayMode.PLAYING:
+                    # Replay loop (lazy load frames)
+                    if self.replay_running and self.current_frame_idx < len(self.episode_indices):
+                        frame = self._get_frame(self.current_frame_idx)
+                        if frame is None:
+                            print("[InteractiveReplay] Failed to load frame, stopping")
+                            self.replay_running = False
+                        else:
+                            # Send based on mode
+                            if self.mode == "token":
+                                motion_token, left_hand, right_hand = extract_action_token(frame)
+                                self.zmq.send_token(motion_token, left_hand, right_hand)
+                            else:
+                                action = extract_action_joints(frame)
+                                self.zmq.send_action(action)
+
+                            # Progress logging
+                            if self.current_frame_idx % 30 == 0:
+                                print(f"[InteractiveReplay] Frame {self.current_frame_idx}/{len(self.episode_indices)}")
+
+                            self.current_frame_idx += 1
+                    else:
+                        # Replay finished
+                        if self.replay_running:
+                            print("[InteractiveReplay] Replay finished")
+                            self.replay_running = False
+                        self.current_mode = InteractiveReplayMode.IDLE_PLANER
+                        print("[InteractiveReplay] Mode: IDLE_PLANER (replay done)")
+
+                # Frame timing
+                elapsed = time.perf_counter() - prev_time
+                sleep_time = control_interval - elapsed
+                if sleep_time > 0:
+                    time.sleep(sleep_time)
+                prev_time = time.perf_counter()
+
+        finally:
+            print("[InteractiveReplay] Shutting down...")
+            # Send idle planner before exit
+            self._switch_to_idle_planner()
+            for _ in range(10):  # Send a few frames
+                self._send_idle_planner()
+                time.sleep(0.033)
+            self.kb.stop()
+            self.zmq.stop()
+            print("[InteractiveReplay] Done")
+
+
 def main():
     parser = argparse.ArgumentParser(
-        description="Replay a LeRobot dataset episode in MuJoCo simulation via C++ WBC."
+        description="Interactive replay with keyboard control for MuJoCo simulation via C++ WBC."
     )
     parser.add_argument(
         "--data_dir",
         type=str,
-        default="/home/zzz/unitree_sh_disk/tools/ycb/datasets/SONIC/test/2026-07-22/origin/",
+        default="/home/zzz/zzy/walk_to_table_and_place_apple_on_pink_plate",
         help="Path to LeRobot dataset directory",
+    )
+    parser.add_argument(
+        "--data_dirs",
+        type=str,
+        nargs="+",
+        default=None,
+        help="List of data directories for episode navigation",
     )
     parser.add_argument(
         "--episode_idx",
         type=int,
-        default=1,
-        help="Episode index to replay",
+        default=0,
+        help="Initial episode index",
     )
     parser.add_argument(
         "--fps",
@@ -466,25 +966,38 @@ def main():
     parser.add_argument(
         "--mode",
         type=str,
-        default="planner",
+        default="token",
         choices=["planner", "token"],
         help='Mode: "planner" sends direct joint values, "token" sends motion_token (like real client)',
+    )
+    parser.add_argument(
+        "--slow_walk_speed",
+        type=float,
+        default=0.3,
+        help="Speed for slow walk mode (default: 0.3)",
     )
 
     args = parser.parse_args()
 
     from psi.utils import resolve_data_path
-    args.data_dir = str(resolve_data_path(args.data_dir))
+    data_dir = str(resolve_data_path(args.data_dir))
+    data_dirs = [str(resolve_data_path(d)) for d in args.data_dirs] if args.data_dirs else [data_dir]
 
-    replay = ReplaySim(
-        data_dir=args.data_dir,
+    replay = InteractiveReplaySim(
+        data_dir=data_dir,
         episode_idx=args.episode_idx,
         fps=args.fps,
         zmq_host=args.zmq_host,
         zmq_port=args.zmq_port,
         mode=args.mode,
+        slow_walk_speed=args.slow_walk_speed,
+        data_dirs=data_dirs,
     )
-    replay.run()
+    try:
+        replay.run()
+    except KeyboardInterrupt:
+        print("\n[InteractiveReplay] Interrupted")
+        replay.running = False
 
 
 if __name__ == "__main__":
