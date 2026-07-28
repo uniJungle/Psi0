@@ -512,6 +512,24 @@ bash deploy.sh --input-type keyboard real
 
 我需要的新的逻辑是：启动代码后此时可以用键盘控制，可以按 1 在 slow walk 和 idle planner之间切换，在slow walk时可以按wasd控制，在idle_planner中可以按qe转方向，这个就用他自带的，我只不过仅需要两个模式--按enter回放当前条数据--完成后切到idle_planner--然后可以键盘控制--此时按 enter 可以重播当前数据，按右箭头可以跳到下一条数据，左箭头可以回到上一条数据，再按enter可以播放--ctrlc/esc退出时切回idle planner程序再结束。
 
+ok，目前已经在仿真中实现我想要的逻辑，并测试成功。
+
+启动之后会自动切换到idle_planner，然后按1切换到slow walking，此时可以用键盘wasdqe控制，按enter可以回放/暂停当前数据，zc切换上一条下一条数据。
+
+下一步是在真机回放中使用相同的逻辑：
+```bash
+# 1. 启动真机控制器
+bash ./real/SONIC/scripts/collect_psi0-sonic-data-manual.sh deploy
+
+# 2. 运行交互式回放
+python scripts/replay/new_replay_real.py \
+    --data_dir /path/to/dataset \
+    --episode_idx 0 \
+    --zmq_port 5556 \
+    --mode token \
+    --eef none
+```
+
 
 
 
