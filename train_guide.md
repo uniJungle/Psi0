@@ -36,8 +36,8 @@ source .venv-act/bin/activate
 
 bash baselines/act/serve_act_g1_real.sh \
   --run-dir /home/karthus_chen/ycb_ws/checkpoints/ACT_200k_g1_33d_walk_to_table_and_place_apple_on_pink_plate_100 \
-  --ckpt-step 30000 \
-  --n-action-steps 50
+  --ckpt-step 40000 \
+  --n-action-steps 1
 
 # 终端 5：ACT client（接管 :5556 → PLANNER → STREAMED_MOTION → 发 token）
 cd /home/karthus_chen/ycb_ws/Psi0
@@ -50,7 +50,8 @@ python real/deploy/act_inference.py \
   --eef brainco \
   --dds-interface enp4s0 \
   --visualization \
-  --save-pred-action /home/karthus_chen/ycb_ws/datasets/SONIC/walk_to_table_and_place_apple_on_pink_plate/closeloop_act_30k
+  --save-pred-action /home/karthus_chen/ycb_ws/datasets/SONIC/walk_to_table_and_place_apple_on_pink_plate/closeloop_act_40k \
+  --save-pred-state /home/karthus_chen/ycb_ws/datasets/SONIC/walk_to_table_and_place_apple_on_pink_plate/closeloop_act_40k
 ```
 
 ### Open-loop Inference

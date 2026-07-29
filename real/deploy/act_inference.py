@@ -98,6 +98,10 @@ def _dim_label(dim: int) -> str:
     return f"action[{dim}] {name}"
 
 
+def _state_dim_label(dim: int) -> str:
+    return f"qpos[{dim}]"
+
+
 def save_pred_action_trajectory(pred: np.ndarray, out_dir: Path) -> None:
     """Save executed 68D pred trajectory: .npy + 68 rows × 1 col plot (same layout as openloop)."""
     pred = np.asarray(pred, dtype=np.float32)
@@ -134,6 +138,47 @@ def save_pred_action_trajectory(pred: np.ndarray, out_dir: Path) -> None:
 
     axes[-1].set_xlabel("frame index", fontsize=9)
     plot_path = plots_dir / "closedloop_pred_all_dims.png"
+    fig.savefig(plot_path, dpi=120, bbox_inches="tight")
+    plt.close(fig)
+    print(f"[SAVE] plot -> {plot_path}")
+
+
+def save_pred_state_trajectory(pred: np.ndarray, out_dir: Path) -> None:
+    """Save postprocessed 29D qpos trajectory: .npy + 29 rows × 1 col plot."""
+    pred = np.asarray(pred, dtype=np.float32)
+    if pred.ndim != 2 or pred.shape[1] != QPOS_DIM:
+        raise ValueError(f"Expected pred state shape (T, {QPOS_DIM}), got {pred.shape}")
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    npy_path = out_dir / "pred_states.npy"
+    np.save(npy_path, pred)
+    print(f"[SAVE] pred states {pred.shape} -> {npy_path}")
+
+    t = np.arange(pred.shape[0])
+    plots_dir = out_dir / "plots"
+    plots_dir.mkdir(parents=True, exist_ok=True)
+
+    fig, axes = plt.subplots(
+        QPOS_DIM,
+        1,
+        figsize=(14, 1.1 * QPOS_DIM),
+        sharex=True,
+        constrained_layout=True,
+    )
+    if QPOS_DIM == 1:
+        axes = [axes]
+
+    for dim, ax in enumerate(axes):
+        ax.plot(t, pred[:, dim], linestyle="-", alpha=0.95, color="C0", label="pred_state", linewidth=1.0)
+        ax.set_ylabel(_state_dim_label(dim), fontsize=7, rotation=0, labelpad=45, va="center")
+        ax.tick_params(axis="both", labelsize=6)
+        ax.grid(True, alpha=0.25)
+        if dim == 0:
+            ax.legend(loc="upper right", fontsize=7)
+            ax.set_title(f"ACT closed-loop pred qpos  |  all {QPOS_DIM} dims", fontsize=11)
+
+    axes[-1].set_xlabel("frame index", fontsize=9)
+    plot_path = plots_dir / "closedloop_pred_state_all_dims.png"
     fig.savefig(plot_path, dpi=120, bbox_inches="tight")
     plt.close(fig)
     print(f"[SAVE] plot -> {plot_path}")
@@ -613,12 +658,49 @@ def build_state33(robot_state: dict, brainco_hand=None) -> np.ndarray:
     return np.concatenate([body_q, left, right], axis=0).astype(np.float32)
 
 
+def extract_body_q_target(robot_state: dict | None) -> np.ndarray | None:
+    if robot_state is None:
+        return None
+    for key in ("body_q_target", "body_q_measured", "body_q"):
+        if key in robot_state and robot_state[key] is not None:
+            arr = np.asarray(robot_state[key], dtype=np.float32).reshape(-1)
+            if arr.size >= QPOS_DIM:
+                return arr[:QPOS_DIM].copy()
+    return None
+
+
+def wait_for_body_q_target(
+    state_sub: RobotStateSubscriber,
+    prev_qpos: np.ndarray | None,
+    timeout_s: float = 0.08,
+    poll_s: float = 0.002,
+) -> tuple[np.ndarray | None, dict | None]:
+    """Poll g1_debug for the latest body_q_target after token decode."""
+    deadline = time.perf_counter() + max(timeout_s, 0.0)
+    latest_state = state_sub.get_state()
+    latest_qpos = extract_body_q_target(latest_state)
+
+    while time.perf_counter() < deadline:
+        state = state_sub.get_state()
+        if state is not None:
+            latest_state = state
+            qpos = extract_body_q_target(state)
+            if qpos is not None:
+                latest_qpos = qpos
+                if prev_qpos is None or not np.allclose(qpos, prev_qpos, atol=1e-6, rtol=0.0):
+                    return qpos, latest_state
+        time.sleep(poll_s)
+    return latest_qpos, latest_state
+
+
 def execute_action68(
     action: np.ndarray,
     token_publisher: TokenPublisher,
+    state_sub: RobotStateSubscriber | None = None,
+    prev_body_q_target: np.ndarray | None = None,
     brainco_hand=None,
-) -> None:
-    """Send body token via ZMQ; drive Brainco hands via DDS when enabled."""
+) -> tuple[np.ndarray | None, dict | None]:
+    """Send token, fetch decoded 29D qpos from g1_debug, and drive Brainco hands."""
     if action.ndim > 1:
         action = action[0]
     token, left_2d, right_2d = split_action68(action)
@@ -632,6 +714,14 @@ def execute_action68(
     #   cmd[[0,2,3,4,5]] = others  (Thumb, Index, Middle, Ring, Pinky)
     if brainco_hand is not None:
         brainco_hand.set_2d_targets(left_2d, right_2d)
+
+    if state_sub is None:
+        return None, None
+
+    decoded_qpos, latest_state = wait_for_body_q_target(state_sub, prev_body_q_target)
+    if decoded_qpos is None:
+        return None, latest_state
+    return decoded_qpos, latest_state
 
 
 def main():
@@ -693,6 +783,17 @@ def main():
             "Optional DIR (default: real/deploy/logs/pred_actions/<timestamp>)"
         ),
     )
+    parser.add_argument(
+        "--save-pred-state",
+        nargs="?",
+        const="",
+        default=None,
+        metavar="DIR",
+        help=(
+            "Save decoded/postprocessed 29D qpos trajectory (.npy + 29×1 plot). "
+            "Optional DIR (default: real/deploy/logs/pred_states/<timestamp>)"
+        ),
+    )
     args = parser.parse_args()
 
     rerun_logger = None
@@ -713,7 +814,18 @@ def main():
         save_pred_dir.mkdir(parents=True, exist_ok=True)
         print(f"[MAIN] Will save pred actions to {save_pred_dir}")
 
+    save_pred_state_dir: Path | None = None
+    if args.save_pred_state is not None:
+        if args.save_pred_state:
+            save_pred_state_dir = Path(args.save_pred_state)
+        else:
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            save_pred_state_dir = _DEPLOY_DIR / "logs" / "pred_states" / ts
+        save_pred_state_dir.mkdir(parents=True, exist_ok=True)
+        print(f"[MAIN] Will save pred states to {save_pred_state_dir}")
+
     pred_action_buffer: list[np.ndarray] = []
+    pred_state_buffer: list[np.ndarray] = []
 
     policy = ACTHTTPClient(host=args.host, port=args.port)
     print(f"[MAIN] Checking ACT server at {args.host}:{args.port} ...")
@@ -789,6 +901,7 @@ def main():
         keepalive.set_action(first_actions[0])
     keepalive.start()
     print(f"[MAIN] Running @ {args.freq} Hz in STREAMED_MOTION. Ctrl+C to stop.")
+    last_body_q_target: np.ndarray | None = extract_body_q_target(last_robot_state)
 
     try:
         for step in range(args.max_steps):
@@ -832,7 +945,21 @@ def main():
                         break
                     t0 = time.perf_counter()
                     keepalive.set_action(actions[i])
-                    execute_action68(actions[i], token_publisher, brainco_hand=brainco_hand)
+                    pred_state29, post_state = execute_action68(
+                        actions[i],
+                        token_publisher,
+                        state_sub=state_sub,
+                        prev_body_q_target=last_body_q_target,
+                        brainco_hand=brainco_hand,
+                    )
+                    if post_state is not None:
+                        last_robot_state = post_state
+                    if pred_state29 is not None:
+                        last_body_q_target = pred_state29.copy()
+                        if save_pred_state_dir is not None:
+                            pred_state_buffer.append(pred_state29.astype(np.float32, copy=True))
+                    elif save_pred_state_dir is not None and step % 10 == 0 and i == 0:
+                        print("[VLA] warning: missing body_q_target for pred-state logging")
                     if save_pred_dir is not None:
                         pred_action_buffer.append(np.asarray(actions[i], dtype=np.float32).reshape(-1)[:ACTION_DIM])
                     if rerun_logger is not None and last_vis_frame is not None:
@@ -879,6 +1006,13 @@ def main():
                 print(f"[SAVE] failed to save pred actions: {e}")
         elif save_pred_dir is not None:
             print("[SAVE] no pred actions recorded")
+        if save_pred_state_dir is not None and pred_state_buffer:
+            try:
+                save_pred_state_trajectory(np.stack(pred_state_buffer, axis=0), save_pred_state_dir)
+            except Exception as e:
+                print(f"[SAVE] failed to save pred states: {e}")
+        elif save_pred_state_dir is not None:
+            print("[SAVE] no pred states recorded")
         print("[MAIN] Shutdown complete.")
 
 if __name__ == "__main__":
