@@ -92,3 +92,14 @@ python scripts/replay/replay_real.py \
   --data_dir /home/karthus_chen/ycb_ws/datasets/SONIC/walk_to_table_and_place_apple_on_pink_plate/openloop_act/episode_000099 \
   --episode_idx 0
 ```
+
+## Psi0
+### Training
+```bash
+# Launch the training script via tmux
+tmux new -s train_psi
+cd /sh/zzy/Psi0
+export WANDB_API_KEY='your-wandb-api-key'
+wandb login
+bash train_psi.sh
+```
