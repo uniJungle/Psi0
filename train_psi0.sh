@@ -36,13 +36,14 @@ MAX_GRAD_NORM="1.0"
 
 # 模型配置
 ACTION_CHUNK_SIZE="30"
-ACTION_DIM="78"
+ACTION_DIM="68"
 ACTION_EXEC_HORIZON="30"
 OBSERVATION_HORIZON="1"
-ODIM="43"
+ODIM="33"
 VIEW_FEATURE_DIM="2048"
 MAX_DELAY="8"
 TRAIN_DIFFUSION_STEPS="1000"
+IMAGE_SIZE="480 640"
 
 # 预训练模型路径
 MODEL_CKPT_PATH="/hfm/cache/checkpoints/psi0/pre.fast.1by1.2601091803.ckpt.ego200k.he30k"
@@ -237,8 +238,9 @@ finetune_real_psi0_config \
 --data.transform.field.no-use-norm-mask \
 --data.transform.field.normalize-state \
 --data.transform.model.img-aug \
---data.transform.model.resize.size 240 320 \
---data.transform.model.center_crop.size 240 320 \
+--data.transform.repack.image_keys=observation.images.egocentric_right \
+--data.transform.model.resize.size ${IMAGE_SIZE} \
+--data.transform.model.center_crop.size ${IMAGE_SIZE} \
 --model.model_name_or_path=${MODEL_CKPT_PATH} \
 --model.pretrained-action-header-path=${PRETRAINED_ACTION_HEADER_PATH} \
 --model.noise-scheduler=flow \
