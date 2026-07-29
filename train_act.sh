@@ -16,7 +16,7 @@ CHECKPOINT_BASE_DIR="/sh/zzy/checkpoints"
 EXP_NAME="ACT_200k_g1_33d_walk_to_table_and_place_apple_on_pink_plate_100"
 
 # ACT 超参数（在此调节，会通过 env 传给 baselines/act/train_act_g1_real.sh）
-TRAIN_BATCH_SIZE="256"
+TRAIN_BATCH_SIZE="128"
 GRADIENT_ACCUMULATION_STEPS="1"
 MAX_TRAINING_STEPS="200000"
 CHECKPOINTING_STEPS="10000"

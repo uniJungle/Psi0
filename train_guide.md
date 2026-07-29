@@ -97,9 +97,9 @@ python scripts/replay/replay_real.py \
 ### Training
 ```bash
 # Launch the training script via tmux
-tmux new -s train_psi
+tmux new -s train_psi0
 cd /sh/zzy/Psi0
-export WANDB_API_KEY='your-wandb-api-key'
+export WANDB_API_KEY='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'
 wandb login
-bash train_psi.sh
+bash train_psi0.sh
 ```

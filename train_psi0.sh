@@ -8,24 +8,15 @@ PROJECT_ROOT="/sh/zzy/Psi0"
 VENV_PATH="${PROJECT_ROOT}/.venv-psi/bin/activate"
 CACHE_ROOT="/sh/zzy/.cache"
 
-# 数据集：root_dir + train_repo_ids -> .../lerobot
-DATASET_ROOT="/hfm/data/sonic/lerobot"
-DATA_REPO_ID="${1:-}"
+# 数据集：root_dir + train_repo_ids -> .../lerobot_v2.1
+DATASET_ROOT="/sh/datasets/g1/sonic/walk_to_table_and_place_apple_on_pink_plate_100"
+DATA_REPO_ID="lerobot_v2.1"
 
-# 默认任务（如果没有通过参数传入）
-if [[ -z "${DATA_REPO_ID}" ]]; then
-    echo "Usage: $0 <task> [exp_name]"
-    echo "Example: $0 Pick_toys_into_box_and_lift_and_turn_and_put_on_the_chair_new_target_yaw pick-toys"
-    exit 1
-fi
-
-EXP_NAME="${2:-}"
-task_words=$(echo "$DATA_REPO_ID" | tr '[:upper:]' '[:lower:]' | tr '_' ' ')
-default_exp=$(echo "$task_words" | awk '{if (NF>=2) print $1 "-" $2; else print $1}')
-EXP_NAME="${EXP_NAME:-$default_exp}"
+CHECKPOINT_BASE_DIR="/sh/zzy/checkpoints"
+EXP_NAME="PSI0_40k_g1_33d_walk_to_table_and_place_apple_on_pink_plate_100"
 
 # PSI0 超参数（在此调节）
-TRAIN_BATCH_SIZE="16"
+TRAIN_BATCH_SIZE="32"
 GRADIENT_ACCUMULATION_STEPS="1"
 MAX_TRAINING_STEPS="40000"
 CHECKPOINTING_STEPS="5000"
@@ -35,7 +26,7 @@ WARMUP_STEPS="1000"
 MAX_GRAD_NORM="1.0"
 
 # 模型配置
-ACTION_CHUNK_SIZE="30"
+ACTION_CHUNK_SIZE="50"
 ACTION_DIM="68"
 ACTION_EXEC_HORIZON="30"
 OBSERVATION_HORIZON="1"
@@ -46,10 +37,10 @@ TRAIN_DIFFUSION_STEPS="1000"
 IMAGE_SIZE="480 640"
 
 # 预训练模型路径
-MODEL_CKPT_PATH="/hfm/cache/checkpoints/psi0/pre.fast.1by1.2601091803.ckpt.ego200k.he30k"
-PRETRAINED_ACTION_HEADER_PATH="/hfm/cache/checkpoints/psi0/postpre.1by1.pad36.2601131206.ckpt.he30k"
+MODEL_CKPT_PATH="${CACHE_ROOT}/checkpoints/psi0/pre.fast.1by1.2601091803.ckpt.ego200k.he30k"
+PRETRAINED_ACTION_HEADER_PATH="${CACHE_ROOT}/checkpoints/psi0/postpre.1by1.pad36.2601131206.ckpt.he30k"
 
-CUDA_DEVICES="${CUDA_DEVICES:-0,1,2,3,4,5,6,7}"
+CUDA_DEVICES="0,1"
 NUM_GPUS=$(echo "${CUDA_DEVICES}" | tr ',' '\n' | wc -l)
 
 # wandb（设 WANDB_ENABLED=false 可跳过）
@@ -212,6 +203,7 @@ finetune_real_psi0_config \
 --seed=292285 \
 --exp=${EXP_NAME} \
 --train.name=sonic \
+--train.output_dir=${CHECKPOINT_BASE_DIR} \
 --train.data_parallel=ddp \
 --train.mixed_precision=bf16 \
 --train.train_batch_size=${TRAIN_BATCH_SIZE} \
@@ -228,7 +220,7 @@ finetune_real_psi0_config \
 --train.lr_scheduler_type=cosine \
 --train.lr_scheduler_kwargs.weight_decay=1e-6 \
 --train.lr_scheduler_kwargs.betas 0.95 0.999 \
---log.report_to=wandb \
+--log.report_to=${REPORT_TO} \
 --data.root_dir=${DATASET_ROOT} \
 --data.train_repo_ids=${DATA_REPO_ID} \
 --data.transform.field.stat-path=meta/stats_psi0.json \

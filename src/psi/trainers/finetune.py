@@ -92,7 +92,7 @@ class FinetuneTrainer(Trainer):
     def init_qwen3vl_models(self):
         vlm_model = Qwen3VLForConditionalGeneration.from_pretrained(
             self.model_cfg.model_name_or_path,
-            attn_implementation="flash_attention_2",
+            attn_implementation="sdpa",
             dtype=torch.bfloat16
         )
         overwatch.info(f"Load pretrained VLM model from {self.model_cfg.model_name_or_path}")
