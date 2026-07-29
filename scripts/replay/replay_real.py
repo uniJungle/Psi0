@@ -139,9 +139,18 @@ def extract_brainco_2d(frame: dict[str, Any]) -> tuple[np.ndarray, np.ndarray]:
     """Extract Brainco 2D targets ``[thumb_aux, others]`` from a frame."""
     left = _as_1d(frame.get("teleop.left_hand_joints"), np.zeros(2))
     right = _as_1d(frame.get("teleop.right_hand_joints"), np.zeros(2))
-    # Fall back to tail of observation.state / action.wbc (33D brainco layout).
+    # Psi0 68D action: motion_token(64) + left(2) + right(2)
+    if left.size < 2 or right.size < 2:
+        action68 = _as_1d(frame.get("action"), np.zeros(0))
+        if action68.size >= 68:
+            left = action68[64:66]
+            right = action68[66:68]
+    # Fall back to tail of observation.state / action.wbc / states (33D brainco layout).
     if left.size < 2:
-        state = _as_1d(frame.get("action.wbc"), _as_1d(frame.get("observation.state"), np.zeros(33)))
+        state = _as_1d(
+            frame.get("action.wbc"),
+            _as_1d(frame.get("states"), _as_1d(frame.get("observation.state"), np.zeros(33))),
+        )
         if state.size >= 33:
             left = state[29:31]
             right = state[31:33]
@@ -155,15 +164,29 @@ def extract_brainco_2d(frame: dict[str, Any]) -> tuple[np.ndarray, np.ndarray]:
 
 
 def extract_action_token(frame: dict[str, Any]) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Extract motion token and hand joints from a dataset frame."""
-    motion_token = _as_1d(frame.get("action.motion_token"), np.zeros(64))
-    left_hand = _pad_hand_joints_to_dex3(
-        _as_1d(frame.get("teleop.left_hand_joints"), np.zeros(7))
-    )
-    right_hand = _pad_hand_joints_to_dex3(
-        _as_1d(frame.get("teleop.right_hand_joints"), np.zeros(7))
-    )
-    return motion_token, left_hand, right_hand
+    """Extract motion token and hand joints from a dataset frame.
+
+    Supports:
+      - raw SONIC: action.motion_token + teleop.*_hand_joints
+      - Psi0 lerobot_v2.1: action[68] = token(64) + hand(4)
+    """
+    motion_token = _as_1d(frame.get("action.motion_token"), np.zeros(0))
+    left_hand = _as_1d(frame.get("teleop.left_hand_joints"), np.zeros(0))
+    right_hand = _as_1d(frame.get("teleop.right_hand_joints"), np.zeros(0))
+
+    action68 = _as_1d(frame.get("action"), np.zeros(0))
+    if motion_token.size < 64 and action68.size >= 64:
+        motion_token = action68[:64]
+    if left_hand.size < 2 and action68.size >= 66:
+        left_hand = action68[64:66]
+    if right_hand.size < 2 and action68.size >= 68:
+        right_hand = action68[66:68]
+
+    if motion_token.size < 64:
+        motion_token = np.zeros(64, dtype=np.float64)
+    left_hand = _pad_hand_joints_to_dex3(left_hand if left_hand.size else np.zeros(7))
+    right_hand = _pad_hand_joints_to_dex3(right_hand if right_hand.size else np.zeros(7))
+    return motion_token[:64], left_hand, right_hand
 
 
 def create_brainco_hand(dds_interface: str):

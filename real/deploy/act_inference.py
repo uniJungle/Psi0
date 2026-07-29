@@ -1,334 +1,884 @@
-import os
-import time
-import threading
-import json
+"""ACT real-robot client for SONIC + Brainco (33D state / 68D action).
 
-import cv2
+Matches training layout from run_config:
+  - image key: observation.images.egocentric_right
+  - state: qpos(29) + hand(4) = 33
+  - action: motion_token(64) + hand(4) = 68
+    hand(4) = left[thumb_aux, others] + right[thumb_aux, others]
+
+Body tokens go to SONIC WBC via ZMQ Protocol v4.
+Brainco hands go via DDS (eef.brainco), same path as replay_real / BRAINCO_HAND.md:
+  2D [thumb_aux, others] → broadcast to 6 motors → rt/brainco/*/cmd
+"""
+
+from __future__ import annotations
+
+import argparse
+import signal
+import sys
+import threading
+import time
+from base64 import b64decode, b64encode
+from collections import deque
+from datetime import datetime
+from pathlib import Path
+from typing import Optional
+
+import matplotlib
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import msgpack
 import numpy as np
 import requests
-import json_numpy
-
-from multiprocessing import Array, Event
-from teleop.master_whole_body import RobotTaskmaster
-from teleop.robot_control.compute_tau import GetTauer
 import zmq
+from numpy.lib.format import descr_to_dtype, dtype_to_descr
 
-URL = "http://localhost:8014/act" 
-TASK_INSTRUCTION = "Put toys into box and lift it and turn and put on the chair."
+# gear_sonic / eef live in the GR00T-WholeBodyControl submodule.
+_GROOT_ROOT = Path(__file__).resolve().parents[2] / "third_party" / "GR00T-WholeBodyControl"
+if _GROOT_ROOT.is_dir():
+    sys.path.insert(0, str(_GROOT_ROOT))
+
+_DEPLOY_DIR = Path(__file__).resolve().parent
+if str(_DEPLOY_DIR) not in sys.path:
+    sys.path.insert(0, str(_DEPLOY_DIR))
+
+from gear_sonic.utils.teleop.zmq.zmq_planner_sender import (  # noqa: E402
+    build_command_message,
+    build_planner_message,
+    pack_pose_message,
+)
+
+# ---- layout matching ACT_200k_g1_33d_* training ----
+IMAGE_KEY = "observation.images.egocentric_right"
+STATE_DIM = 33
+ACTION_DIM = 68
+TOKEN_DIM = 64
+HAND_DIM = 2  # brainco per hand: [thumb_aux, others]
+QPOS_DIM = 29
+
+FSQ_MIN = -0.625
+FSQ_MAX = 0.625
+FSQ_STEP = 0.0625
+
+LOCOMOTION_MODE_IDLE = 0
+
+TASK_INSTRUCTION = "walk to table and place apple on pink plate"
+FREQ_VLA = 30
+MAX_STEPS = 100000
+
+running = threading.Event()
+running.set()
 
 
-FREQ_VLA = 30   
-FREQ_CTRL = 60  
-MAX_STEPS = 500
+def _observation_for_rerun(frame_rgb: np.ndarray) -> dict:
+    """Build LeRobot-style image observation for Rerun (CHW torch tensor)."""
+    import torch
 
-ACTION_REPEAT = max(1, int(round(FREQ_CTRL / FREQ_VLA)))
-
-json_numpy.patch()
-
-
-class RSCamera:
-    def __init__(self):
-        self.context = zmq.Context()
-        self.socket = self.context.socket(zmq.REQ)
-        self.socket.connect("tcp://192.168.123.164:5556")
-
-    def get_frame(self):
-        self.socket.send(b"get_frame")
-
-        rgb_bytes, _, _ = self.socket.recv_multipart()
-
-        rgb_array = np.frombuffer(rgb_bytes, np.uint8)
-        rgb_image = cv2.imdecode(rgb_array, cv2.IMREAD_COLOR)
-        return rgb_image
+    chw = torch.from_numpy(np.ascontiguousarray(frame_rgb)).permute(2, 0, 1)
+    return {IMAGE_KEY: chw}
 
 
+def _state_for_rerun(states: np.ndarray) -> np.ndarray:
+    return np.asarray(states, dtype=np.float64).ravel()[:STATE_DIM]
 
-def get_observation(camera, state):
-    frame = camera.get_frame()
-    # frame = cv2.resize(frame, (224, 224), interpolation=cv2.INTER_AREA)
-    frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    img = frame.astype(np.uint8)
 
-    img_obs = {
-        "video": frame,
-    }
-    state_obs = {
-        "arm_joints": np.array(state["arm_joints"]),
-        "hand_joints": np.array(state["hand_joints"]),
-    }
-    return img_obs, state_obs
+def _action_for_rerun(action: np.ndarray) -> np.ndarray:
+    return np.asarray(action, dtype=np.float64).ravel()[:ACTION_DIM]
 
+
+HAND_DIM_NAMES = ("L_thumb_aux", "L_others", "R_thumb_aux", "R_others")
+
+
+def _dim_label(dim: int) -> str:
+    if dim < TOKEN_DIM:
+        return f"token[{dim}]"
+    hand_i = dim - TOKEN_DIM
+    name = HAND_DIM_NAMES[hand_i] if hand_i < len(HAND_DIM_NAMES) else f"hand[{hand_i}]"
+    return f"action[{dim}] {name}"
+
+
+def save_pred_action_trajectory(pred: np.ndarray, out_dir: Path) -> None:
+    """Save executed 68D pred trajectory: .npy + 68 rows × 1 col plot (same layout as openloop)."""
+    pred = np.asarray(pred, dtype=np.float32)
+    if pred.ndim != 2 or pred.shape[1] != ACTION_DIM:
+        raise ValueError(f"Expected pred shape (T, {ACTION_DIM}), got {pred.shape}")
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    npy_path = out_dir / "pred_actions.npy"
+    np.save(npy_path, pred)
+    print(f"[SAVE] pred actions {pred.shape} -> {npy_path}")
+
+    t = np.arange(pred.shape[0])
+    plots_dir = out_dir / "plots"
+    plots_dir.mkdir(parents=True, exist_ok=True)
+
+    fig, axes = plt.subplots(
+        ACTION_DIM,
+        1,
+        figsize=(14, 1.1 * ACTION_DIM),
+        sharex=True,
+        constrained_layout=True,
+    )
+    if ACTION_DIM == 1:
+        axes = [axes]
+
+    for dim, ax in enumerate(axes):
+        ax.plot(t, pred[:, dim], linestyle="-", alpha=0.95, color="C0", label="pred", linewidth=1.0)
+        ax.set_ylabel(_dim_label(dim), fontsize=7, rotation=0, labelpad=55, va="center")
+        ax.tick_params(axis="both", labelsize=6)
+        ax.grid(True, alpha=0.25)
+        if dim == 0:
+            ax.legend(loc="upper right", fontsize=7)
+            ax.set_title(f"ACT closed-loop pred  |  all {ACTION_DIM} dims", fontsize=11)
+
+    axes[-1].set_xlabel("frame index", fontsize=9)
+    plot_path = plots_dir / "closedloop_pred_all_dims.png"
+    fig.savefig(plot_path, dpi=120, bbox_inches="tight")
+    plt.close(fig)
+    print(f"[SAVE] plot -> {plot_path}")
+
+
+def fsq_quantize(continuous_value, fsq_min=FSQ_MIN, fsq_max=FSQ_MAX, fsq_step=FSQ_STEP):
+    clipped = np.clip(continuous_value, fsq_min, fsq_max)
+    quantized = np.round(clipped / fsq_step) * fsq_step
+    return np.clip(quantized, fsq_min, fsq_max)
+
+
+def numpy_serialize(o):
+    if isinstance(o, (np.ndarray, np.generic)):
+        data = o.data if o.flags["C_CONTIGUOUS"] else o.tobytes()
+        return {
+            "__numpy__": b64encode(data).decode(),
+            "dtype": dtype_to_descr(o.dtype),
+            "shape": o.shape,
+        }
+    raise TypeError(f"Object of type {o.__class__.__name__} is not JSON serializable")
+
+
+def numpy_deserialize(dct):
+    if "__numpy__" in dct:
+        np_obj = np.frombuffer(b64decode(dct["__numpy__"]), descr_to_dtype(dct["dtype"]))
+        return np_obj.reshape(dct["shape"]) if dct["shape"] else np_obj[0]
+    return dct
+
+
+def convert_numpy_in_dict(data, func):
+    if isinstance(data, dict):
+        if "__numpy__" in data:
+            return func(data)
+        return {key: convert_numpy_in_dict(value, func) for key, value in data.items()}
+    if isinstance(data, list):
+        return [convert_numpy_in_dict(item, func) for item in data]
+    if isinstance(data, (np.ndarray, np.generic)):
+        return func(data)
+    return data
+
+
+def pad_hand_to_dex3(hand: np.ndarray) -> np.ndarray:
+    """Pad Brainco 2D hand to Dex3 7D wire format expected by Protocol v4."""
+    hand = np.asarray(hand, dtype=np.float32).reshape(-1)
+    if hand.size >= 7:
+        return hand[:7].astype(np.float32)
+    out = np.zeros(7, dtype=np.float32)
+    out[: hand.size] = hand
+    return out
+
+
+def take_hand(vec, hand_dim: int = HAND_DIM) -> np.ndarray:
+    arr = np.asarray(vec, dtype=np.float32).reshape(-1)
+    if arr.size >= hand_dim:
+        return arr[:hand_dim]
+    out = np.zeros(hand_dim, dtype=np.float32)
+    out[: arr.size] = arr
+    return out
+
+
+def split_action68(action: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Split 68D action → token64, left_2d[thumb_aux, others], right_2d[thumb_aux, others]."""
+    action = np.asarray(action, dtype=np.float32).reshape(-1)
+    if action.size < ACTION_DIM:
+        raise ValueError(f"action dim {action.size} < {ACTION_DIM}")
+    token = action[:TOKEN_DIM]
+    left_2d = action[TOKEN_DIM : TOKEN_DIM + HAND_DIM]
+    right_2d = action[TOKEN_DIM + HAND_DIM : TOKEN_DIM + 2 * HAND_DIM]
+    return token, left_2d, right_2d
+
+
+def create_brainco_hand(dds_interface: str):
+    try:
+        from eef.brainco.brainco import Brainco
+    except ModuleNotFoundError as e:
+        raise ModuleNotFoundError(
+            f"{e}\n"
+            "Brainco DDS needs SONIC teleop deps (unitree_sdk2py + eef).\n"
+            "Run client in GR00T .venv_teleop, or install into current env:\n"
+            "  cd third_party/GR00T-WholeBodyControl\n"
+            "  uv pip install -e external_dependencies/unitree_sdk2_python --python <your-python>\n"
+            "See real/SONIC/BRAINCO_HAND.md"
+        ) from e
+
+    print(f"[Brainco] Initializing DDS (interface={dds_interface or 'default'})...")
+    hand = Brainco(passive=False, network_interface=dds_interface or None)
+    hand.change_open_pose(801)
+    hand.set_gripper_targets(0.0, 0.0)
+    print("[Brainco] Ready — will drive hands via set_2d_targets (2D→6D broadcast)")
+    return hand
+
+
+def shutdown_brainco_hand(hand) -> None:
+    if hand is None:
+        return
+    try:
+        hand.set_gripper_targets(0.0, 0.0)
+        time.sleep(0.1)
+    except Exception as exc:
+        print(f"[Brainco] open-on-exit failed: {exc}")
+    try:
+        hand.close()
+    except Exception as exc:
+        print(f"[Brainco] close failed: {exc}")
+    print("[Brainco] Shutdown complete")
+
+
+def _parse_tcp_endpoint(address: str) -> tuple[str, int]:
+    """Parse 'tcp://host:port' or 'host:port' → (host, port)."""
+    s = address.strip()
+    if s.startswith("tcp://"):
+        s = s[len("tcp://") :]
+    if ":" not in s:
+        raise ValueError(f"Bad camera address (need host:port): {address}")
+    host, port_s = s.rsplit(":", 1)
+    return host, int(port_s)
+
+
+class ComposedCamera:
+    """SUB client for SONIC composed_camera SensorServer (PUB on :5555).
+
+    Do NOT use the legacy RealSense REQ ``get_frame`` client here — the robot
+    camera is a ZMQ PUB stream (see ``[Sensor server] Message sent: ...``).
+    Training stereo right eye maps: ego_view_right → observation.images.egocentric_right.
+    """
+
+    # Preference order for live stream keys → IMAGE_KEY
+    STREAM_KEY_CANDIDATES = (
+        "ego_view_right",
+        "egocentric_right",
+        "ego_view",
+        "egocentric",
+    )
+
+    def __init__(self, address: str = "tcp://192.168.123.164:5555", stream_key: str | None = None):
+        host, port = _parse_tcp_endpoint(address)
+        from gear_sonic.camera.composed_camera import ComposedCameraClientSensor
+
+        self._client = ComposedCameraClientSensor(server_ip=host, port=port)
+        self._stream_key = stream_key
+        self._resolved_key: str | None = None
+        print(f"[Camera] SUB composed_camera at tcp://{host}:{port} (PUB server)")
+
+    def wait_ready(self, timeout_s: float = 15.0) -> None:
+        deadline = time.perf_counter() + timeout_s
+        while time.perf_counter() < deadline:
+            sample = self._client.read(blocking=False)
+            if sample and sample.get("images"):
+                keys = list(sample["images"].keys())
+                self._resolved_key = self._pick_key(keys)
+                print(f"[Camera] Streams={keys}, using '{self._resolved_key}' → {IMAGE_KEY}")
+                return
+            time.sleep(0.1)
+        raise TimeoutError(
+            f"No frames from composed_camera within {timeout_s}s. "
+            "On robot: python -m gear_sonic.camera.composed_camera --port 5555 ..."
+        )
+
+    def _pick_key(self, keys: list[str]) -> str:
+        if self._stream_key:
+            if self._stream_key not in keys:
+                raise KeyError(f"stream_key={self._stream_key!r} not in {keys}")
+            return self._stream_key
+        for cand in self.STREAM_KEY_CANDIDATES:
+            if cand in keys:
+                return cand
+        if not keys:
+            raise KeyError("camera message has empty images dict")
+        return keys[0]
+
+    def get_frame(self) -> np.ndarray:
+        """Return RGB uint8 HxWx3 matching training image."""
+        sample = self._client.read(blocking=False)
+        if sample is None or not sample.get("images"):
+            # brief blocking wait for first/new frame
+            sample = self._client.read(blocking=True)
+        if sample is None or not sample.get("images"):
+            raise RuntimeError("composed_camera returned empty message")
+        if self._resolved_key is None:
+            self._resolved_key = self._pick_key(list(sample["images"].keys()))
+        img = sample["images"].get(self._resolved_key)
+        if img is None:
+            raise KeyError(f"{self._resolved_key} missing; have {list(sample['images'])}")
+        return np.asarray(img, dtype=np.uint8)
+
+    def close(self) -> None:
+        try:
+            self._client.close()
+        except Exception:
+            pass
+
+
+class RobotStateSubscriber:
+    def __init__(self, host="localhost", port=5557, topic="g1_debug", queue_size=1):
+        self._context = zmq.Context()
+        self._socket = self._context.socket(zmq.SUB)
+        self._socket.connect(f"tcp://{host}:{port}")
+        self._socket.setsockopt_string(zmq.SUBSCRIBE, topic)
+        self._socket.setsockopt(zmq.RCVTIMEO, 100)
+        self._socket.setsockopt(zmq.RCVHWM, 1)
+        self._topic = topic
+        self._lock = threading.Lock()
+        self._state_queue: deque = deque(maxlen=queue_size)
+        self._running = True
+        self._thread = threading.Thread(target=self._recv_loop, daemon=True)
+        self._thread.start()
+
+    def _recv_loop(self):
+        while self._running:
+            try:
+                msg = self._socket.recv()
+            except zmq.Again:
+                continue
+            except zmq.ZMQError:
+                break
+            topic_bytes = self._topic.encode("utf-8")
+            payload = msg[len(topic_bytes) :] if msg.startswith(topic_bytes) else msg
+            try:
+                state = msgpack.unpackb(payload, raw=False)
+                with self._lock:
+                    self._state_queue.append(state)
+            except Exception as e:
+                print(f"[StateSubscriber] Unpack error: {e}")
+
+    def get_state(self) -> Optional[dict]:
+        with self._lock:
+            return self._state_queue[-1] if self._state_queue else None
+
+    def stop(self):
+        self._running = False
+        self._thread.join(timeout=0.5)
+        self._socket.close(linger=0)
+        self._context.term()
+
+
+class TokenPublisher:
+    """ZMQ PUB for SONIC zmq_manager — same handshake as replay_real token mode."""
+
+    def __init__(self, host="*", port=5556, topic="pose"):
+        self._context = zmq.Context()
+        self._socket = self._context.socket(zmq.PUB)
+        bind_host = "*" if host in ("localhost", "127.0.0.1", "") else host
+        endpoint = f"tcp://{bind_host}:{port}"
+        try:
+            self._socket.bind(endpoint)
+        except zmq.ZMQError as e:
+            raise RuntimeError(
+                f"Failed to bind {endpoint}: {e}\n"
+                "Port 5556 must be free. Run `enable_control.py` (handoff, not --hold) "
+                "first and wait until it exits; stop pico / another publisher."
+            ) from e
+        self._topic = topic
+        self._port = port
+        self._send_lock = threading.Lock()
+        time.sleep(0.5)
+        print(f"[TokenPublisher] Bound PUB at {endpoint}")
+
+    def send_command(self, start=False, stop=False, planner=False):
+        msg = build_command_message(start=start, stop=stop, planner=planner)
+        with self._send_lock:
+            self._socket.send(msg)
+        print(f"[TokenPublisher] Command: start={start} stop={stop} planner={planner}")
+
+    def send_idle_planner(self):
+        msg = build_planner_message(
+            mode=LOCOMOTION_MODE_IDLE,
+            movement=[0.0, 0.0, 0.0],
+            facing=[1.0, 0.0, 0.0],
+            speed=-1.0,
+            height=-1.0,
+        )
+        with self._send_lock:
+            self._socket.send(msg)
+
+    def enter_streamed_motion(self, warmup_seconds: float = 2.0):
+        """Match replay_real token mode handshake exactly.
+
+        ZMQManager only accepts start while in PLANNER:
+          1) start + planner=True  → CONTROL
+          2) start + planner=False → STREAMED_MOTION (consumes pose/token)
+
+        Caller MUST start publishing pose/token immediately after this returns.
+        Deploy auto-falls back to PLANNER+IDLE if no pose for ~1s.
+        """
+        print("[TokenPublisher] Step 1/2: start control in PLANNER mode...")
+        self.send_command(start=True, stop=False, planner=True)
+        time.sleep(max(warmup_seconds, 2.0))
+
+        print("[TokenPublisher] Step 2/2: switch to STREAMED_MOTION (pose/token)...")
+        self.send_command(start=True, stop=False, planner=False)
+        # Keep this short — replay_real sleeps 1.0 then immediately streams tokens.
+        # Any further gap before first pose risks STREAM_TIMEOUT → PLANNER+IDLE.
+        time.sleep(0.2)
+
+    def handoff_to_idle_planner(self, hold_seconds: float = 2.0):
+        """Leave deploy running in PLANNER+idle and free the port."""
+        print(
+            f"[TokenPublisher] Handoff: PLANNER + idle ({hold_seconds}s), "
+            "then release port..."
+        )
+        self.send_command(start=True, stop=False, planner=True)
+        time.sleep(0.5)
+        deadline = time.perf_counter() + max(0.0, hold_seconds)
+        while time.perf_counter() < deadline:
+            self.send_idle_planner()
+            time.sleep(1.0 / 30.0)
+
+    def publish_token(self, token64: np.ndarray, left_hand: np.ndarray, right_hand: np.ndarray):
+        """Publish body token (+ padded hand fields for Protocol v4 wire compat)."""
+        pose_data = {
+            "token_state": token64.astype(np.float32).reshape(1, -1),
+            "left_hand_joints": pad_hand_to_dex3(left_hand).reshape(1, -1),
+            "right_hand_joints": pad_hand_to_dex3(right_hand).reshape(1, -1),
+        }
+        msg = pack_pose_message(pose_data, topic=self._topic, version=4)
+        with self._send_lock:
+            self._socket.send(msg)
+
+    def send_stream_heartbeat(self):
+        """Quiet command heartbeat (planner=False) to keep STREAMED_MOTION alive."""
+        msg = build_command_message(start=True, stop=False, planner=False)
+        with self._send_lock:
+            self._socket.send(msg)
+
+    def stop(self, send_stop: bool = False):
+        if self._socket is not None:
+            if send_stop:
+                self.send_command(start=False, stop=True, planner=True)
+                time.sleep(0.1)
+            with self._send_lock:
+                self._socket.close(linger=0)
+                self._socket = None
+        if self._context is not None:
+            self._context.term()
+            self._context = None
+        print(f"[TokenPublisher] Stopped — port {self._port} freed")
+
+
+class StreamKeepalive:
+    """Republish last token at stream_hz while policy inference may take >1s.
+
+    Deploy zmq_manager falls back to PLANNER+IDLE if no pose for ~1s. replay_real
+    never has that gap; ACT HTTP inference often does.
+    """
+
+    def __init__(self, publisher: TokenPublisher, stream_hz: float = 30.0):
+        self._publisher = publisher
+        self._interval = 1.0 / max(stream_hz, 1.0)
+        self._lock = threading.Lock()
+        self._last_action: Optional[np.ndarray] = None
+        self._running = False
+        self._thread: Optional[threading.Thread] = None
+        self._cmd_every = 20  # reaffirm STREAMED_MOTION periodically
+        self._ticks = 0
+
+    def set_action(self, action68: np.ndarray) -> None:
+        with self._lock:
+            self._last_action = np.asarray(action68, dtype=np.float32).reshape(-1).copy()
+
+    def start(self) -> None:
+        if self._running:
+            return
+        self._running = True
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
+        print(f"[StreamKeepalive] Publishing last token @ {1.0 / self._interval:.0f} Hz")
+
+    def stop(self) -> None:
+        self._running = False
+        if self._thread is not None:
+            self._thread.join(timeout=1.0)
+            self._thread = None
+
+    def _loop(self) -> None:
+        while self._running:
+            t0 = time.perf_counter()
+            with self._lock:
+                action = None if self._last_action is None else self._last_action.copy()
+            if action is not None:
+                try:
+                    token, left_2d, right_2d = split_action68(action)
+                    self._publisher.publish_token(fsq_quantize(token), left_2d, right_2d)
+                except Exception as e:
+                    print(f"[StreamKeepalive] publish failed: {e}")
+                self._ticks += 1
+                if self._ticks % self._cmd_every == 0:
+                    try:
+                        self._publisher.send_stream_heartbeat()
+                    except Exception:
+                        pass
+            elapsed = time.perf_counter() - t0
+            sleep_t = self._interval - elapsed
+            if sleep_t > 0:
+                time.sleep(sleep_t)
+
+
+class ACTHTTPClient:
+    def __init__(self, host: str = "127.0.0.1", port: int = 22085, timeout: float = 30.0):
+        self.url = f"http://{host}:{port}/act"
+        self.health_url = f"http://{host}:{port}/health"
+        self.reset_url = f"http://{host}:{port}/reset"
+        self.timeout = timeout
+        self.session = requests.Session()
+
+    def health_check(self) -> bool:
+        try:
+            resp = self.session.get(self.health_url, timeout=self.timeout)
+            return resp.ok and resp.json().get("status") == "ok"
+        except Exception as e:
+            print(f"[ACT] health check failed: {e}")
+            return False
+
+    def reset(self) -> None:
+        try:
+            self.session.get(self.reset_url, timeout=self.timeout)
+        except Exception as e:
+            print(f"[ACT] reset failed: {e}")
+
+    def query_action(
+        self,
+        image: np.ndarray,
+        states: np.ndarray,
+        instruction: str,
+    ) -> np.ndarray:
+        payload = {
+            "image": {IMAGE_KEY: np.asarray(image, dtype=np.uint8)},
+            "state": {"states": np.asarray(states, dtype=np.float32)},
+            "instruction": instruction,
+            "history": {},
+            "condition": {},
+            "gt_action": [],
+            "dataset_name": "real",
+            "timestamp": str(datetime.now()).replace(" ", "_").replace(":", "-"),
+        }
+        resp = self.session.post(
+            self.url,
+            json=convert_numpy_in_dict(payload, numpy_serialize),
+            timeout=self.timeout,
+        )
+        resp.raise_for_status()
+        data = convert_numpy_in_dict(resp.json(), numpy_deserialize)
+        if "error" in data:
+            raise RuntimeError(data["error"])
+        action = np.asarray(data["action"], dtype=np.float32)
+        if action.ndim == 1:
+            action = action[None, :]
+        return action
+
+
+def build_state33(robot_state: dict, brainco_hand=None) -> np.ndarray:
+    """Compose training state: body_q(29) + left_hand(2) + right_hand(2)."""
+    body_q = np.asarray(
+        robot_state.get("body_q_measured", robot_state.get("body_q")),
+        dtype=np.float32,
+    ).reshape(-1)
+    if body_q.size < QPOS_DIM:
+        raise ValueError(f"body_q_measured dim {body_q.size} < {QPOS_DIM}")
+    body_q = body_q[:QPOS_DIM]
+
+    if brainco_hand is not None:
+        left_2d, right_2d = brainco_hand.get_2d_states()
+        left = take_hand(left_2d)
+        right = take_hand(right_2d)
+    else:
+        left = take_hand(
+            robot_state.get(
+                "left_hand_q_measured",
+                robot_state.get("left_hand_q", np.zeros(HAND_DIM)),
+            )
+        )
+        right = take_hand(
+            robot_state.get(
+                "right_hand_q_measured",
+                robot_state.get("right_hand_q", np.zeros(HAND_DIM)),
+            )
+        )
+    return np.concatenate([body_q, left, right], axis=0).astype(np.float32)
+
+
+def execute_action68(
+    action: np.ndarray,
+    token_publisher: TokenPublisher,
+    brainco_hand=None,
+) -> None:
+    """Send body token via ZMQ; drive Brainco hands via DDS when enabled."""
+    if action.ndim > 1:
+        action = action[0]
+    token, left_2d, right_2d = split_action68(action)
+    token_qtz = fsq_quantize(token)
+
+    # Body / WBC path
+    token_publisher.publish_token(token_qtz, left_2d, right_2d)
+
+    # Brainco DDS path: 2D [thumb_aux, others] → 6D broadcast inside set_2d_targets
+    #   cmd[1] = thumb_aux
+    #   cmd[[0,2,3,4,5]] = others  (Thumb, Index, Middle, Ring, Pinky)
+    if brainco_hand is not None:
+        brainco_hand.set_2d_targets(left_2d, right_2d)
 
 
 def main():
-    shared_data = {
-        "kill_event": Event(),
-        "session_start_event": Event(),
-        "failure_event": Event(),
-        "end_event": Event(),
-        "dirname": None,
-    }
-    kill_event = shared_data["kill_event"]
-
-    robot_shm_array = Array("d", 512, lock=False)
-    teleop_shm_array = Array("d", 64, lock=False)
-
-    master = RobotTaskmaster(
-        task_name="inference",
-        shared_data=shared_data,
-        robot_shm_array=robot_shm_array,
-        teleop_shm_array=teleop_shm_array,
-        robot="g1",
+    parser = argparse.ArgumentParser(description="ACT SONIC Brainco inference client (33/68)")
+    parser.add_argument("--host", type=str, default="localhost", help="ACT policy server host")
+    parser.add_argument("--port", type=int, default=22085, help="ACT policy server port")
+    parser.add_argument("--zmq-host", type=str, default="localhost", help="Robot state ZMQ host")
+    parser.add_argument("--zmq-pub-port", type=int, default=5556, help="Token PUB port to WBC")
+    parser.add_argument("--zmq-sub-port", type=int, default=5557, help="Robot state SUB port")
+    parser.add_argument("--zmq-topic", type=str, default="pose")
+    parser.add_argument("--zmq-sub-topic", type=str, default="g1_debug")
+    parser.add_argument(
+        "--camera-address",
+        type=str,
+        default="tcp://192.168.123.164:5555",
+        help="SONIC composed_camera PUB endpoint (SUB client)",
     )
+    parser.add_argument(
+        "--camera-stream-key",
+        type=str,
+        default=None,
+        help="Live stream key (default: ego_view_right → egocentric_right)",
+    )
+    parser.add_argument("--instruction", type=str, default=TASK_INSTRUCTION)
+    parser.add_argument("--freq", type=float, default=FREQ_VLA, help="Policy query / execute rate (Hz)")
+    parser.add_argument("--max-steps", type=int, default=MAX_STEPS)
+    parser.add_argument(
+        "--eef",
+        type=str,
+        default="brainco",
+        choices=["none", "brainco"],
+        help="End-effector: brainco (DDS 2D→6D) or none (body token only)",
+    )
+    parser.add_argument(
+        "--dds-interface",
+        type=str,
+        default="enp4s0",
+        help="DDS network interface for Brainco (see BRAINCO_HAND.md)",
+    )
+    parser.add_argument(
+        "--warmup",
+        type=float,
+        default=2.0,
+        help="Seconds in PLANNER after start before STREAMED_MOTION (match replay_real)",
+    )
+    parser.add_argument(
+        "--visualization",
+        action="store_true",
+        help="Open Rerun viewer for live image / state(33) / action(68) (same as eval_g1_36_brainco_act)",
+    )
+    parser.add_argument(
+        "--save-pred-action",
+        nargs="?",
+        const="",
+        default=None,
+        metavar="DIR",
+        help=(
+            "Save executed 68D pred trajectory (.npy + 68×1 plot). "
+            "Optional DIR (default: real/deploy/logs/pred_actions/<timestamp>)"
+        ),
+    )
+    args = parser.parse_args()
 
-    get_tauer = GetTauer()
-    camera = RSCamera()
+    rerun_logger = None
+    rerun_idx = 0
+    visualization_data = None
+    if args.visualization:
+        from utils.rerun_visualizer import RerunLogger, visualization_data
+        rerun_logger = RerunLogger()
+        print("[MAIN] Rerun visualization enabled")
 
-    pred_action_buffer = {"actions": None, "idx": 0}
-    pred_action_lock = threading.Lock()
+    save_pred_dir: Path | None = None
+    if args.save_pred_action is not None:
+        if args.save_pred_action:
+            save_pred_dir = Path(args.save_pred_action)
+        else:
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            save_pred_dir = _DEPLOY_DIR / "logs" / "pred_actions" / ts
+        save_pred_dir.mkdir(parents=True, exist_ok=True)
+        print(f"[MAIN] Will save pred actions to {save_pred_dir}")
 
-    state_lock = threading.Lock()
-    shared_robot_state = {
-        "motor": None,
-        "hand": None,
-    }
+    pred_action_buffer: list[np.ndarray] = []
 
-    running = Event()
-    running.set()
+    policy = ACTHTTPClient(host=args.host, port=args.port)
+    print(f"[MAIN] Checking ACT server at {args.host}:{args.port} ...")
+    if not policy.health_check():
+        print("[MAIN] ACT server not healthy. Start serve_act_g1_real.sh first.")
+        return
+    print("[MAIN] ACT server OK")
+    policy.reset()
 
-    sequence_done_event = Event()
-    sequence_done_event.set() 
+    brainco_hand = None
+    if args.eef == "brainco":
+        brainco_hand = create_brainco_hand(args.dds_interface)
+    else:
+        print("[MAIN] --eef=none: body token only, hands not commanded")
 
-    def action_request_thread():
-        s = requests.Session()
-        for step in range(MAX_STEPS):
-            if not running.is_set():
-                break
+    # Same ZMQ ownership as replay_real: only one PUB on :5556.
+    # Run enable_control.py (default handoff) first so deploy is in CONTROL and port is free.
+    token_publisher = TokenPublisher(host="*", port=args.zmq_pub_port, topic=args.zmq_topic)
+    state_sub = RobotStateSubscriber(
+        host=args.zmq_host, port=args.zmq_sub_port, topic=args.zmq_sub_topic, queue_size=1
+    )
+    camera = ComposedCamera(address=args.camera_address, stream_key=args.camera_stream_key)
+    keepalive = StreamKeepalive(token_publisher, stream_hz=max(args.freq, 30.0))
+    print(f"[MAIN] Camera={args.camera_address}, image_key={IMAGE_KEY}, eef={args.eef}")
 
-            sequence_done_event.wait()
+    # Prep obs BEFORE STREAMED_MOTION — same as replay_real which has frames ready
+    # and starts token streaming immediately after the mode switch.
+    print("[MAIN] Waiting for first camera frame...")
+    camera.wait_ready(timeout_s=20.0)
 
-            try:
-                with state_lock:
-                    motor = shared_robot_state["motor"].copy() if shared_robot_state["motor"] is not None else None
-                    hand = shared_robot_state["hand"].copy() if shared_robot_state["hand"] is not None else None
-                
-                if motor is None or hand is None:
-                    print("[VLA] Waiting for robot state...")
-                    time.sleep(0.01)
-                    continue
-
-                arm_joints = motor[15:29]
-                hand_joints = hand
-                leg_joints = motor[:15]
-
-                # websocket obs payload
-                state = {
-                    "arm_joints": arm_joints,
-                    "hand_joints": hand_joints,
-                }
-
-                img_obs, state_obs = get_observation(camera, state)
-                payload = {
-                    "image": img_obs,
-                    "state": state_obs,
-                    "gt_action": None,
-                    "dataset_name": None,
-                    "instruction": TASK_INSTRUCTION,
-                    "history": None,
-                    "condition": None,
-                    "timestamp": None,
-                }
-                resp = s.post(URL, json=payload)
-                resp.raise_for_status()
-                actions = np.array(resp.json()["action"], dtype=float)
-                if len(actions.shape) != 2 or actions.shape[1] != 36:
-                    print("[VLA] invalid action seq:", actions.shape)
-                    continue
-
-                with pred_action_lock:
-                    pred_action_buffer["actions"] = actions
-                    pred_action_buffer["idx"] = 0
-                print(f"[VLA] Got sequence of {len(actions)} actions.")
-                sequence_done_event.clear()
-            except Exception as e:
-                print(f"[VLA] step {step} failed: {e}")
-            time.sleep(1.0 / FREQ_VLA)
-
-        print("[VLA] Finished or stopped. Signaling kill_event.")
-        kill_event.set()
-
-    def apply_action_from_buffer():
-        current_lr_arm_q, current_lr_arm_dq = master.get_robot_data()
-
-        with state_lock:
-            shared_robot_state["motor"] = master.motorstate.copy()
-            shared_robot_state["hand"] = master.handstate.copy()
-
-        with pred_action_lock:
-            actions = pred_action_buffer["actions"]
-            idx = pred_action_buffer["idx"]
-
-            action = None
-            have_vla = False
-
-            if actions is not None:
-                real_idx = idx // ACTION_REPEAT
-                if real_idx < len(actions):
-                    action = actions[real_idx]
-                    have_vla = True
-
-                    pred_action_buffer["idx"] += 1
-
-                    next_real_idx = pred_action_buffer["idx"] // ACTION_REPEAT
-                    if next_real_idx >= len(actions):
-                        pred_action_buffer["actions"] = None
-                        pred_action_buffer["idx"] = 0
-                        sequence_done_event.set()
-                else:
-                    pred_action_buffer["actions"] = None
-                    pred_action_buffer["idx"] = 0
-                    sequence_done_event.set()
-
-        arm_cmd = None
-        hand_cmd = None
-        if have_vla:
-            if action.shape[0] < 36:
-                print("[CTRL] Invalid action shape:", action.shape)
-            else:
-
-                vx = action[32]
-                vy = action[33]
-                vyaw = action[34]
-                target_yaw = action[35]
-
-                vx = 0.35 if vx > 0.25 else 0
-                vy = 0 if abs(vy) < 0.3 else 0.5 * (1 if vy > 0 else -1)
-
-
-                rpyh   = action[28:32]
-                arm_cmd = action[14:28]
-                hand_cmd = action[:14]
-
-                master.torso_roll   = rpyh[0]
-                master.torso_pitch  = rpyh[1]
-                master.torso_yaw    = rpyh[2]
-                master.torso_height = rpyh[3]
-
-                master.vx = vx
-                master.vy = vy
-                master.vyaw = vyaw
-                master.target_yaw = target_yaw
-
-                master.prev_torso_roll   = master.torso_roll
-                master.prev_torso_pitch  = master.torso_pitch
-                master.prev_torso_yaw    = master.torso_yaw
-                master.prev_torso_height = master.torso_height
-
-                master.prev_vx   = master.vx
-                master.prev_vy  = master.vy
-                master.prev_vyaw    = master.vyaw
-                master.prev_target_yaw = master.target_yaw
-
-                master.prev_arm = arm_cmd
-                master.prev_hand = hand_cmd
-
-        
-        if not have_vla:
-            master.torso_roll   = master.prev_torso_roll
-            master.torso_pitch  = master.prev_torso_pitch
-            master.torso_yaw    = master.prev_torso_yaw
-            master.torso_height = master.prev_torso_height
-
-            arm_cmd = master.prev_arm
-            hand_cmd = master.prev_hand
-
-            master.vx = master.prev_vx
-            master.vy = 0
-            master.vyaw = master.prev_vyaw
-            master.target_yaw = master.prev_target_yaw
-        
-
-        master.get_ik_observation(record=False)
-
-
-        pd_target, pd_tauff, raw_action = master.body_ik.solve_whole_body_ik(
-            left_wrist=None,
-            right_wrist=None,
-            current_lr_arm_q=current_lr_arm_q,
-            current_lr_arm_dq=current_lr_arm_dq,
-            observation=master.observation,
-            extra_hist=master.extra_hist,
-            is_teleop=False,
+    print("[MAIN] Waiting for robot state (g1_debug)...")
+    last_robot_state = None
+    for _ in range(30):
+        st = state_sub.get_state()
+        if st is not None:
+            last_robot_state = st
+            print(f"[MAIN] Got robot state keys={list(st.keys())}")
+            break
+        time.sleep(0.5)
+    else:
+        print(
+            "[MAIN] WARNING: no robot state after 15s. "
+            "Will retry each step; ensure deploy is streaming g1_debug on :5557."
         )
 
-        master.last_action = np.concatenate([
-            raw_action.copy(),
-            (master.motorstate - master.default_dof_pos)[15:] / master.action_scale,
-        ])
+    def _signal_handler(sig, frame):
+        print("\n[MAIN] Caught signal, shutting down...")
+        running.clear()
 
-        if arm_cmd is not None:
-            pd_target[15:] = arm_cmd
-            tau_arm = np.asarray(get_tauer(arm_cmd), dtype=np.float64).reshape(-1)
-            pd_tauff[15:] = tau_arm
+    signal.signal(signal.SIGINT, _signal_handler)
+    signal.signal(signal.SIGTERM, _signal_handler)
 
-        if hand_cmd is not None:
-            with master.dual_hand_data_lock:
-                master.hand_shm_array[:] = hand_cmd
+    dt = 1.0 / max(args.freq, 1e-3)
 
-        master.body_ctrl.ctrl_whole_body(
-            pd_target[15:], pd_tauff[15:], pd_target[:15], pd_tauff[:15]
-        )
+    # Warm first policy query while still in PLANNER (enable_control left deploy there).
+    # Avoids multi-second CUDA cold-start AFTER STREAMED_MOTION (would trigger 1s timeout).
+    first_actions = None
+    last_vis_frame: np.ndarray | None = None
+    if last_robot_state is not None:
+        try:
+            states0 = build_state33(last_robot_state, brainco_hand=brainco_hand)
+            frame0 = camera.get_frame()
+            last_vis_frame = frame0
+            print(f"[MAIN] Warmup policy query, frame={frame0.shape} state={states0.shape}")
+            first_actions = policy.query_action(frame0, states0, args.instruction)
+            print(f"[MAIN] Warmup action chunk={first_actions.shape}")
+        except Exception as e:
+            print(f"[MAIN] Warmup policy query failed (will retry in loop): {e}")
 
-        return pd_target
-
-    
-
-    def control_loop_thread():
-        dt = 1.0 / FREQ_CTRL
-        while running.is_set() and not kill_event.is_set():
-            try:
-                apply_action_from_buffer()
-            except Exception as e:
-                print("[CTRL] loop error:", e)
-            time.sleep(dt)
-        print("[CTRL] Control loop stopped.")
+    # Match replay_real: switch to STREAMED_MOTION then stream tokens with no gap.
+    token_publisher.enter_streamed_motion(warmup_seconds=args.warmup)
+    if first_actions is not None and first_actions.size:
+        keepalive.set_action(first_actions[0])
+    keepalive.start()
+    print(f"[MAIN] Running @ {args.freq} Hz in STREAMED_MOTION. Ctrl+C to stop.")
 
     try:
-        stabilize_thread = threading.Thread(target=master.maintain_standing, daemon=True)
-        stabilize_thread.start()
-        master.episode_kill_event.set()
-        print("[MAIN] Initialize with standing pose...")
+        for step in range(args.max_steps):
+            if not running.is_set():
+                break
+            try:
+                robot_state = state_sub.get_state()
+                if robot_state is not None:
+                    last_robot_state = robot_state
+                elif last_robot_state is not None:
+                    robot_state = last_robot_state
+                else:
+                    print("[VLA] waiting for robot state...")
+                    time.sleep(0.05)
+                    continue
 
-        time.sleep(30)
-        master.episode_kill_event.clear()  
+                states = build_state33(robot_state, brainco_hand=brainco_hand)
+                if states.shape[0] != STATE_DIM:
+                    print(f"[VLA] bad state dim {states.shape}, expected {STATE_DIM}")
+                    continue
 
-        master.reset_yaw_offset = True
+                if step == 0 and first_actions is not None:
+                    actions = first_actions
+                    first_actions = None
+                    print(f"[VLA] first frame using warmup chunk={actions.shape}")
+                else:
+                    frame = camera.get_frame()
+                    last_vis_frame = frame
+                    if step == 0:
+                        print(f"[VLA] first frame shape={frame.shape} dtype={frame.dtype}")
+                    # Keepalive continues last token during this (possibly slow) HTTP call.
+                    actions = policy.query_action(frame, states, args.instruction)
 
-        t_req = threading.Thread(target=action_request_thread, daemon=True)
-        t_ctrl = threading.Thread(target=control_loop_thread, daemon=True)
-        t_req.start()
-        t_ctrl.start()
+                if actions.ndim != 2 or actions.shape[-1] != ACTION_DIM:
+                    print(f"[VLA] bad action shape {actions.shape}, expected (T, {ACTION_DIM})")
+                    continue
 
-        print("[MAIN] Running. Ctrl+C to stop.")
-        while not kill_event.is_set():
-            time.sleep(0.5)
-
-        print("[MAIN] kill_event set, preparing to stop...")
-        running.clear()
-        time.sleep(0.5) 
-
-        master.episode_kill_event.set()
-        print("[MAIN] Returning to standing pose for 5s...")
-        time.sleep(5)
-        master.episode_kill_event.clear()
-
-    except KeyboardInterrupt:
-        print("[MAIN] Caught Ctrl+C, exiting...")
-        running.clear()
-        kill_event.set()
+                # Execute the full returned chunk at --freq (keepalive mirrors last action).
+                for i in range(actions.shape[0]):
+                    if not running.is_set():
+                        break
+                    t0 = time.perf_counter()
+                    keepalive.set_action(actions[i])
+                    execute_action68(actions[i], token_publisher, brainco_hand=brainco_hand)
+                    if save_pred_dir is not None:
+                        pred_action_buffer.append(np.asarray(actions[i], dtype=np.float32).reshape(-1)[:ACTION_DIM])
+                    if rerun_logger is not None and last_vis_frame is not None:
+                        visualization_data(
+                            rerun_idx,
+                            _observation_for_rerun(last_vis_frame),
+                            _state_for_rerun(states),
+                            _action_for_rerun(actions[i]),
+                            rerun_logger,
+                        )
+                        rerun_idx += 1
+                    if step % 10 == 0 and i == 0:
+                        _, l2, r2 = split_action68(actions[0])
+                        print(
+                            f"[VLA] step={step} chunk={actions.shape} "
+                            f"token[:3]={actions[0, :3]} left_2d={l2} right_2d={r2}"
+                        )
+                    elapsed = time.perf_counter() - t0
+                    sleep_t = dt - elapsed
+                    if sleep_t > 0:
+                        time.sleep(sleep_t)
+            except Exception as e:
+                print(f"[VLA] step {step} failed: {e}")
+                time.sleep(dt)
     finally:
-        shared_data["end_event"].set()
-        master.stop()
+        print("[MAIN] Shutting down...")
+        running.clear()
+        keepalive.stop()
+        try:
+            token_publisher.handoff_to_idle_planner(hold_seconds=2.0)
+        except Exception as e:
+            print(f"[MAIN] handoff failed: {e}")
+        try:
+            token_publisher.stop(send_stop=False)
+        except Exception as e:
+            print(f"[MAIN] publisher stop failed: {e}")
+        camera.close()
+        shutdown_brainco_hand(brainco_hand)
+        state_sub.stop()
+        if save_pred_dir is not None and pred_action_buffer:
+            try:
+                save_pred_action_trajectory(np.stack(pred_action_buffer, axis=0), save_pred_dir)
+            except Exception as e:
+                print(f"[SAVE] failed to save pred actions: {e}")
+        elif save_pred_dir is not None:
+            print("[SAVE] no pred actions recorded")
         print("[MAIN] Shutdown complete.")
 
 if __name__ == "__main__":

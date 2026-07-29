@@ -74,6 +74,7 @@ class Server:
         run_dir: Path,
         ckpt_step: int | str = "latest",
         device: str = "cuda:0",
+        n_action_steps: int | None = None,
     ):
         if not torch.cuda.is_available():
             raise RuntimeError("CUDA is not available. Please check your CUDA installation.")
@@ -108,10 +109,6 @@ class Server:
         num_params = sum(p.numel() for p in self.model.parameters())
         overwatch.info(f"Parameters (in millions): {num_params * 1e-6:.3f} Total", ctx_level=1)
 
-
-        self.previous_rpy = np.array([0.0, 0.0, 0.0], dtype=np.float32)
-        self.previous_height = np.array([0.75], dtype=np.float32)
-
         overwatch.info("Loaded Dataset Statistics from run directory.")
         self.action_state_norm = launch_config.data.transform.field
         assert isinstance(self.action_state_norm, ActionStateTransform)
@@ -119,6 +116,23 @@ class Server:
         overwatch.info(f"Action Normalization Type: {self.action_normalization_type}")
 
         self.launch_config = launch_config
+        self.state_dim = int(self.model_cfg.state_dim)
+        self.action_dim = int(self.model_cfg.action_dim)
+        self.image_keys = list(self.launch_config.data.transform.repack.image_keys)
+
+        # Inference override: how many of the predicted chunk to return/execute
+        chunk_size = int(self.model_cfg.chunk_size)
+        default_steps = int(self.model_cfg.n_action_steps)
+        self.n_action_steps = int(n_action_steps) if n_action_steps is not None else default_steps
+        if self.n_action_steps < 1 or self.n_action_steps > chunk_size:
+            raise ValueError(
+                f"n_action_steps={self.n_action_steps} out of range; must be in [1, chunk_size={chunk_size}]"
+            )
+        overwatch.info(
+            f"Serving dims: state={self.state_dim}, action={self.action_dim}, "
+            f"chunk_size={chunk_size}, n_action_steps={self.n_action_steps} "
+            f"(train default={default_steps}), image_keys={self.image_keys}"
+        )
         self.num_image_chunk = 1  # Number of image frames in history
         self.count = 0
 
@@ -188,6 +202,32 @@ class Server:
     def postprocess_action(self, action: np.ndarray) -> np.ndarray:
         return self.maxmin.denormalize(action)
 
+    def _compose_state(self, state_dict: Dict[str, Any]) -> np.ndarray:
+        """Build (state_dim,) obs vector matching SONIC/LeRobot training layout.
+
+        Preferred: ``states`` already shaped as qpos(29)+hand(4/14).
+        Fallback (legacy): ``hand_joints`` + ``arm_joints`` (+ optional torso).
+        """
+        if "states" in state_dict and state_dict["states"] is not None:
+            obs = np.asarray(state_dict["states"], dtype=np.float32).reshape(-1)
+        elif "hand_joints" in state_dict and "arm_joints" in state_dict:
+            hand = np.asarray(state_dict["hand_joints"], dtype=np.float32).reshape(-1)
+            arm = np.asarray(state_dict["arm_joints"], dtype=np.float32).reshape(-1)
+            # Training layout is qpos then hand: if client sent hand+arm (old),
+            # prefer arm(qpos-like)+hand when dims match 29+4 / 29+14.
+            if arm.size + hand.size == self.state_dim and arm.size in (29, 28):
+                obs = np.concatenate([arm, hand], axis=-1)
+            else:
+                obs = np.concatenate([hand, arm], axis=-1)
+        else:
+            raise KeyError(
+                f"state must contain 'states' or ('hand_joints','arm_joints'); got keys={list(state_dict.keys())}"
+            )
+
+        if obs.shape[0] != self.state_dim:
+            obs, _ = pad_to_len(obs, self.state_dim, dim=0)
+        return obs.astype(np.float32)
+
     def predict_action(self, payload: Dict[str, Any]) -> str:
         try:
             request = RequestMessage.deserialize(payload)
@@ -195,32 +235,24 @@ class Server:
                     request.image, request.instruction, request.history, request.state, request.gt_action, request.dataset_name
 
             imgs = {}
-            for cam_idx, img_key in enumerate(self.launch_config.data.transform.repack.image_keys):
-                imgs[f"cam{cam_idx}"] = Image.fromarray(np.clip(image_dict[img_key], 0, 255).astype(np.uint8))
+            for cam_idx, img_key in enumerate(self.image_keys):
+                if img_key not in image_dict:
+                    raise KeyError(
+                        f"Missing image key '{img_key}'. Available: {list(image_dict.keys())}"
+                    )
+                imgs[f"cam{cam_idx}"] = Image.fromarray(
+                    np.clip(image_dict[img_key], 0, 255).astype(np.uint8)
+                )
 
             image_input = self.preprocess_image(imgs)
-            
-            hand_joints = state_dict["hand_joints"].copy() # shape (14,)
-            arm_joints = state_dict["arm_joints"].copy() # shape (14,)
-            torso_rpy = self.previous_rpy # shape (3,)
-            torso_height = self.previous_height # shape (1,)
-            
-            # Ensure all inputs are numpy arrays
-            if hasattr(hand_joints, 'cpu'):
-                hand_joints = hand_joints.cpu().numpy()
-            if hasattr(arm_joints, 'cpu'):
-                arm_joints = arm_joints.cpu().numpy()
-            if hasattr(torso_rpy, 'cpu'):
-                torso_rpy = torso_rpy.cpu().numpy()
-            if hasattr(torso_height, 'cpu'):
-                torso_height = torso_height.cpu().numpy()
-                
-            obs = np.concatenate([hand_joints, arm_joints, torso_rpy, torso_height], axis=-1) # (32,)
-
+            obs = self._compose_state(state_dict)
 
             # state normalization
-            obs_input = self.maxmin.normalize_state_func(obs) # shape (32,)
-            obs_input = torch.from_numpy(obs_input).unsqueeze(0).to(self.device) # (1, 32)
+            if self.maxmin.normalize_state:
+                obs_input = self.maxmin.normalize_state_func(obs)
+            else:
+                obs_input = obs
+            obs_input = torch.from_numpy(np.asarray(obs_input, dtype=np.float32)).unsqueeze(0).to(self.device)
 
             # Debug logging
             for k, v in image_input.items():
@@ -235,7 +267,7 @@ class Server:
 
                 batch = {
                     "observation.images": imgs_tensor.unsqueeze(0),  # (1, T, C, H, W)
-                    "observation.state": obs_input,  # (1, 32)
+                    "observation.state": obs_input,  # (1, state_dim)
                 }
 
                 # Predict action chunk
@@ -246,17 +278,22 @@ class Server:
                     pred_action = pred_actions  # already (T, D)
 
             # Denormalize
-            pred_action = pred_action[:self.model_cfg.n_action_steps, :]
+            pred_action = pred_action[: self.n_action_steps, :]
             pred_actions_denorm = self.maxmin.denormalize(pred_action)
-            
-            self.previous_rpy = pred_action[self.model_cfg.n_action_steps-1, 28:31].cpu().numpy() # shape (3,)
-            self.previous_height = pred_action[self.model_cfg.n_action_steps-1, 31:32].cpu().numpy() # shape (1,)
 
             # Convert to numpy
             if isinstance(pred_actions_denorm, torch.Tensor):
                 pred_actions_denorm = pred_actions_denorm.cpu().numpy()
 
-            overwatch.info(f"Predicted Action: {pred_actions_denorm[0]}")
+            if pred_actions_denorm.shape[-1] != self.action_dim:
+                overwatch.warning(
+                    f"Action dim mismatch: got {pred_actions_denorm.shape[-1]}, expected {self.action_dim}"
+                )
+
+            overwatch.info(
+                f"Predicted Action shape={pred_actions_denorm.shape}, "
+                f"token[:4]={pred_actions_denorm[0, :4]}, hand={pred_actions_denorm[0, 64:]}"
+            )
             self.count += 1
 
             response = ResponseMessage(pred_actions_denorm, 0.0)
@@ -267,12 +304,10 @@ class Server:
 
             overwatch.warning(traceback.format_exc())
             return JSONResponse(content={"error": str(e)}, status_code=500)
-    def reset(self, ):
-        self.previous_rpy = np.array([0.0, 0.0, 0.0], dtype=np.float32)
-        self.previous_height = np.array([0.75], dtype=np.float32)
 
+    def reset(self, ):
         self.count = 0
-        print("=== rpy, height and self.count reset: ", self.previous_rpy, self.previous_height, self.count)
+        print(f"=== server reset: count={self.count}")
         
     def run(self, host: str = "0.0.0.0", port: int = 8000) -> None:
         self.app = FastAPI()
@@ -292,7 +327,14 @@ class Server:
 def serve(cfg: ServerConfig) -> None:
     overwatch.info("Server :: Initializing Policy")
     assert cfg.policy is not None, "which policy to serve?"
-    server = Server(cfg.policy, Path(cfg.run_dir), cfg.ckpt_step, cfg.device)
+    # Reuse ServerConfig.action_exec_horizon as inference-time n_action_steps override
+    server = Server(
+        cfg.policy,
+        Path(cfg.run_dir),
+        cfg.ckpt_step,
+        cfg.device,
+        n_action_steps=cfg.action_exec_horizon,
+    )
 
     overwatch.info("Server :: Spinning Up")
     server.run(cfg.host, cfg.port)
