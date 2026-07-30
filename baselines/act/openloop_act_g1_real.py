@@ -12,15 +12,15 @@ Observations always come from the dataset (not simulated from pred actions).
 
 Output layout::
 
-    <output_dir>/
-      episode_{id:06d}/          # one lerobot_v2.1 dataset per source episode
-        meta/ data/ videos/ plots/
+    <data_root>/openloop_act_{ckpt_step}/episode_{id:06d}/
+      pred_actions.npy
+      meta/ data/ videos/ plots/
 
 Replay with::
 
     python scripts/replay/replay_real.py \\
       --input_type zmq_manager --mode token --eef brainco \\
-      --data_dir <output_dir>/episode_{id:06d} --episode_idx 0
+      --data_dir <data_root>/openloop_act_{ckpt_step}/episode_{id:06d} --episode_idx 0
 
 Requires a running ACT server (``baselines/act/serve_act_g1_real.sh``).
 """
@@ -47,6 +47,8 @@ import pandas as pd
 import requests
 from numpy.lib.format import descr_to_dtype, dtype_to_descr
 from tqdm.auto import tqdm
+
+from pred_action_io import resolve_openloop_dir, save_pred_actions_npy
 
 IMAGE_KEY_DEFAULT = "observation.images.egocentric_right"
 STATE_DIM = 33
@@ -442,18 +444,27 @@ def plot_pred_vs_gt(
 def parse_args():
     p = argparse.ArgumentParser(description="ACT open-loop inference → lerobot_v2.1")
     p.add_argument(
+        "--data-root",
+        type=Path,
+        required=True,
+        help=(
+            "Task dataset root, e.g. .../SONIC/walk_to_table_and_place_apple_on_pink_plate. "
+            "Writes to <data-root>/openloop_act_{ckpt_step}/episode_{id:06d}/"
+        ),
+    )
+    p.add_argument(
+        "--ckpt-step",
+        type=int,
+        required=True,
+        help="Checkpoint step used by the ACT server (used in output subdir name)",
+    )
+    p.add_argument(
         "--dataset-dir",
         type=Path,
-        required=True,
-        help="Source Psi0 lerobot_v2.1 dataset root (contains meta/info.json)",
+        default=None,
+        help="Source lerobot_v2.1 root (default: <data-root>/lerobot_v2.1)",
     )
     p.add_argument("--episode-idx", type=int, required=True, help="Source episode index")
-    p.add_argument(
-        "--output-dir",
-        type=Path,
-        required=True,
-        help="Root dir; each episode is written to <output-dir>/episode_{id:06d}/",
-    )
     p.add_argument("--host", type=str, default="localhost", help="ACT policy server host")
     p.add_argument("--port", type=int, default=22085, help="ACT policy server port")
     p.add_argument(
@@ -537,11 +548,17 @@ def rollout_pred_actions(
 
 def main():
     args = parse_args()
-    dataset_dir = args.dataset_dir.resolve()
-    out_root = args.output_dir.resolve()
-    out_dir = out_root / f"episode_{args.episode_idx:06d}"
+    data_root = args.data_root.resolve()
+    dataset_dir = (
+        args.dataset_dir.resolve()
+        if args.dataset_dir is not None
+        else (data_root / "lerobot_v2.1").resolve()
+    )
+    out_dir = resolve_openloop_dir(data_root, args.ckpt_step, args.episode_idx)
     info = load_info(dataset_dir)
     fps = int(info.get("fps", FPS_DEFAULT))
+    print(f"[IO] data_root={data_root}")
+    print(f"[IO] dataset_dir={dataset_dir}")
     print(f"[IO] output episode dir={out_dir}")
 
     parquet_path = resolve_episode_parquet(dataset_dir, args.episode_idx, info)
@@ -591,6 +608,8 @@ def main():
         video.close()
 
     out_dir.mkdir(parents=True, exist_ok=True)
+    save_pred_actions_npy(out_dir, pred_actions)
+
     out_parquet = out_dir / "data" / "chunk-000" / "episode_000000.parquet"
     write_episode_parquet(out_parquet, states, pred_actions, fps=fps, episode_index=0)
     print(f"[IO] wrote {out_parquet}")
@@ -599,20 +618,16 @@ def main():
     write_meta(out_dir, info, dataset_dir, n_frames=n, instruction=instruction, fps=fps)
     write_episode_stats(out_dir, pred_actions, fps=fps)
 
-    np.savez_compressed(
-        out_dir / "openloop_actions.npz",
-        gt_actions=gt_actions,
-        pred_actions=pred_actions,
-        states=states,
-        query_frames=np.asarray(query_frames, dtype=np.int64),
-        n_action_steps=np.int64(max(1, args.n_action_steps)),
-    )
+    # Extra debug arrays (optional); canonical action file is pred_actions.npy
+    np.save(out_dir / "gt_actions.npy", gt_actions.astype(np.float32))
+    np.save(out_dir / "query_frames.npy", np.asarray(query_frames, dtype=np.int64))
 
     plot_pred_vs_gt(gt_actions, pred_actions, out_dir / "plots", args.episode_idx)
 
     print("\n=== Open-loop summary ===")
     print(f"frames={n}  n_action_steps={max(1, args.n_action_steps)}  queries={len(query_frames)}")
     print(f"query_frames (first 10): {query_frames[:10]}{'...' if len(query_frames) > 10 else ''}")
+    print(f"ckpt_step={args.ckpt_step}")
     print(f"output_dir={out_dir}")
 
 if __name__ == "__main__":

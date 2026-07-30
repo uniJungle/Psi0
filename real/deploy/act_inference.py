@@ -40,13 +40,22 @@ if _GROOT_ROOT.is_dir():
     sys.path.insert(0, str(_GROOT_ROOT))
 
 _DEPLOY_DIR = Path(__file__).resolve().parent
+_PSI0_ROOT = Path(__file__).resolve().parents[2]
+_ACT_BASELINE_DIR = _PSI0_ROOT / "baselines" / "act"
 if str(_DEPLOY_DIR) not in sys.path:
     sys.path.insert(0, str(_DEPLOY_DIR))
+if str(_ACT_BASELINE_DIR) not in sys.path:
+    sys.path.insert(0, str(_ACT_BASELINE_DIR))
 
 from gear_sonic.utils.teleop.zmq.zmq_planner_sender import (  # noqa: E402
     build_command_message,
     build_planner_message,
     pack_pose_message,
+)
+from pred_action_io import (  # noqa: E402
+    resolve_closeloop_dir,
+    save_pred_actions_npy,
+    write_pred_lerobot,
 )
 
 # ---- layout matching ACT_200k_g1_33d_* training ----
@@ -66,6 +75,10 @@ LOCOMOTION_MODE_IDLE = 0
 TASK_INSTRUCTION = "walk to table and place apple on pink plate"
 FREQ_VLA = 30
 MAX_STEPS = 100000
+
+# First-round debug: execute only action_chunk[0] each policy query
+# (strict compare vs open-loop with n_action_steps=1).
+DEBUG_EXECUTE_FIRST_ACTION_ONLY = True
 
 running = threading.Event()
 running.set()
@@ -98,20 +111,10 @@ def _dim_label(dim: int) -> str:
     return f"action[{dim}] {name}"
 
 
-def _state_dim_label(dim: int) -> str:
-    return f"qpos[{dim}]"
-
-
 def save_pred_action_trajectory(pred: np.ndarray, out_dir: Path) -> None:
-    """Save executed 68D pred trajectory: .npy + 68 rows × 1 col plot (same layout as openloop)."""
+    """Save executed 68D pred trajectory: pred_actions.npy + 68×1 plot."""
     pred = np.asarray(pred, dtype=np.float32)
-    if pred.ndim != 2 or pred.shape[1] != ACTION_DIM:
-        raise ValueError(f"Expected pred shape (T, {ACTION_DIM}), got {pred.shape}")
-
-    out_dir.mkdir(parents=True, exist_ok=True)
-    npy_path = out_dir / "pred_actions.npy"
-    np.save(npy_path, pred)
-    print(f"[SAVE] pred actions {pred.shape} -> {npy_path}")
+    save_pred_actions_npy(out_dir, pred)
 
     t = np.arange(pred.shape[0])
     plots_dir = out_dir / "plots"
@@ -138,47 +141,6 @@ def save_pred_action_trajectory(pred: np.ndarray, out_dir: Path) -> None:
 
     axes[-1].set_xlabel("frame index", fontsize=9)
     plot_path = plots_dir / "closedloop_pred_all_dims.png"
-    fig.savefig(plot_path, dpi=120, bbox_inches="tight")
-    plt.close(fig)
-    print(f"[SAVE] plot -> {plot_path}")
-
-
-def save_pred_state_trajectory(pred: np.ndarray, out_dir: Path) -> None:
-    """Save postprocessed 29D qpos trajectory: .npy + 29 rows × 1 col plot."""
-    pred = np.asarray(pred, dtype=np.float32)
-    if pred.ndim != 2 or pred.shape[1] != QPOS_DIM:
-        raise ValueError(f"Expected pred state shape (T, {QPOS_DIM}), got {pred.shape}")
-
-    out_dir.mkdir(parents=True, exist_ok=True)
-    npy_path = out_dir / "pred_states.npy"
-    np.save(npy_path, pred)
-    print(f"[SAVE] pred states {pred.shape} -> {npy_path}")
-
-    t = np.arange(pred.shape[0])
-    plots_dir = out_dir / "plots"
-    plots_dir.mkdir(parents=True, exist_ok=True)
-
-    fig, axes = plt.subplots(
-        QPOS_DIM,
-        1,
-        figsize=(14, 1.1 * QPOS_DIM),
-        sharex=True,
-        constrained_layout=True,
-    )
-    if QPOS_DIM == 1:
-        axes = [axes]
-
-    for dim, ax in enumerate(axes):
-        ax.plot(t, pred[:, dim], linestyle="-", alpha=0.95, color="C0", label="pred_state", linewidth=1.0)
-        ax.set_ylabel(_state_dim_label(dim), fontsize=7, rotation=0, labelpad=45, va="center")
-        ax.tick_params(axis="both", labelsize=6)
-        ax.grid(True, alpha=0.25)
-        if dim == 0:
-            ax.legend(loc="upper right", fontsize=7)
-            ax.set_title(f"ACT closed-loop pred qpos  |  all {QPOS_DIM} dims", fontsize=11)
-
-    axes[-1].set_xlabel("frame index", fontsize=9)
-    plot_path = plots_dir / "closedloop_pred_state_all_dims.png"
     fig.savefig(plot_path, dpi=120, bbox_inches="tight")
     plt.close(fig)
     print(f"[SAVE] plot -> {plot_path}")
@@ -518,25 +480,50 @@ class TokenPublisher:
 
 
 class StreamKeepalive:
-    """Republish last token at stream_hz while policy inference may take >1s.
+    """Republish last *already-quantized* token while waiting on ACT inference.
 
-    Deploy zmq_manager falls back to PLANNER+IDLE if no pose for ~1s. replay_real
-    never has that gap; ACT HTTP inference often does.
+    While the main thread executes an action chunk, keepalive MUST be paused so
+    the same token is not published by two threads. Resume only when the action
+    queue is empty / waiting for the next ACT response.
     """
 
     def __init__(self, publisher: TokenPublisher, stream_hz: float = 30.0):
         self._publisher = publisher
         self._interval = 1.0 / max(stream_hz, 1.0)
         self._lock = threading.Lock()
-        self._last_action: Optional[np.ndarray] = None
+        self._last_token_qtz: Optional[np.ndarray] = None
+        self._last_left: Optional[np.ndarray] = None
+        self._last_right: Optional[np.ndarray] = None
+        self._paused = False
         self._running = False
         self._thread: Optional[threading.Thread] = None
         self._cmd_every = 20  # reaffirm STREAMED_MOTION periodically
         self._ticks = 0
 
-    def set_action(self, action68: np.ndarray) -> None:
+    def set_last_sent(
+        self,
+        token_qtz: np.ndarray,
+        left_2d: np.ndarray,
+        right_2d: np.ndarray,
+    ) -> None:
+        """Cache the exact token/hands last published by the main thread."""
         with self._lock:
-            self._last_action = np.asarray(action68, dtype=np.float32).reshape(-1).copy()
+            self._last_token_qtz = np.asarray(token_qtz, dtype=np.float32).reshape(-1).copy()
+            self._last_left = np.asarray(left_2d, dtype=np.float32).reshape(-1).copy()
+            self._last_right = np.asarray(right_2d, dtype=np.float32).reshape(-1).copy()
+
+    def set_action(self, action68: np.ndarray) -> None:
+        """Compatibility helper: quantize action68 and cache as last sent."""
+        token, left_2d, right_2d = split_action68(action68)
+        self.set_last_sent(fsq_quantize(token), left_2d, right_2d)
+
+    def pause(self) -> None:
+        with self._lock:
+            self._paused = True
+
+    def resume(self) -> None:
+        with self._lock:
+            self._paused = False
 
     def start(self) -> None:
         if self._running:
@@ -544,7 +531,7 @@ class StreamKeepalive:
         self._running = True
         self._thread = threading.Thread(target=self._loop, daemon=True)
         self._thread.start()
-        print(f"[StreamKeepalive] Publishing last token @ {1.0 / self._interval:.0f} Hz")
+        print(f"[StreamKeepalive] Publishing last token @ {1.0 / self._interval:.0f} Hz (paused during chunk)")
 
     def stop(self) -> None:
         self._running = False
@@ -556,11 +543,13 @@ class StreamKeepalive:
         while self._running:
             t0 = time.perf_counter()
             with self._lock:
-                action = None if self._last_action is None else self._last_action.copy()
-            if action is not None:
+                paused = self._paused
+                token = None if self._last_token_qtz is None else self._last_token_qtz.copy()
+                left = None if self._last_left is None else self._last_left.copy()
+                right = None if self._last_right is None else self._last_right.copy()
+            if not paused and token is not None and left is not None and right is not None:
                 try:
-                    token, left_2d, right_2d = split_action68(action)
-                    self._publisher.publish_token(fsq_quantize(token), left_2d, right_2d)
+                    self._publisher.publish_token(token, left, right)
                 except Exception as e:
                     print(f"[StreamKeepalive] publish failed: {e}")
                 self._ticks += 1
@@ -658,15 +647,34 @@ def build_state33(robot_state: dict, brainco_hand=None) -> np.ndarray:
     return np.concatenate([body_q, left, right], axis=0).astype(np.float32)
 
 
-def extract_body_q_target(robot_state: dict | None) -> np.ndarray | None:
+def _extract_body_q29(robot_state: dict | None, *keys: str) -> np.ndarray | None:
     if robot_state is None:
         return None
-    for key in ("body_q_target", "body_q_measured", "body_q"):
+    for key in keys:
         if key in robot_state and robot_state[key] is not None:
             arr = np.asarray(robot_state[key], dtype=np.float32).reshape(-1)
             if arr.size >= QPOS_DIM:
                 return arr[:QPOS_DIM].copy()
     return None
+
+
+def extract_body_q_action(robot_state: dict | None) -> np.ndarray | None:
+    """WBC joint target prepared for motors (not body_q_target)."""
+    return _extract_body_q29(robot_state, "body_q_action")
+
+
+def extract_body_q_measured(robot_state: dict | None) -> np.ndarray | None:
+    """Measured robot joint positions; fall back to body_q if needed."""
+    return _extract_body_q29(robot_state, "body_q_measured", "body_q")
+
+
+def extract_body_q_target(robot_state: dict | None) -> np.ndarray | None:
+    """Deprecated: body_q_target is NOT the motor command for the current token.
+
+    Kept as a thin alias for measured qpos so old call sites do not break.
+    Prefer extract_body_q_measured / extract_body_q_action.
+    """
+    return extract_body_q_measured(robot_state)
 
 
 def wait_for_body_q_target(
@@ -675,22 +683,14 @@ def wait_for_body_q_target(
     timeout_s: float = 0.08,
     poll_s: float = 0.002,
 ) -> tuple[np.ndarray | None, dict | None]:
-    """Poll g1_debug for the latest body_q_target after token decode."""
-    deadline = time.perf_counter() + max(timeout_s, 0.0)
-    latest_state = state_sub.get_state()
-    latest_qpos = extract_body_q_target(latest_state)
+    """Deprecated / disabled.
 
-    while time.perf_counter() < deadline:
-        state = state_sub.get_state()
-        if state is not None:
-            latest_state = state
-            qpos = extract_body_q_target(state)
-            if qpos is not None:
-                latest_qpos = qpos
-                if prev_qpos is None or not np.allclose(qpos, prev_qpos, atol=1e-6, rtol=0.0):
-                    return qpos, latest_state
-        time.sleep(poll_s)
-    return latest_qpos, latest_state
+    body_q_target is not SONIC's motor target for the just-sent token. Do not
+    gate token sends on joint-field changes. Returns the latest snapshot once.
+    """
+    _ = (prev_qpos, timeout_s, poll_s)
+    latest_state = state_sub.get_state()
+    return extract_body_q_measured(latest_state), latest_state
 
 
 def execute_action68(
@@ -699,29 +699,57 @@ def execute_action68(
     state_sub: RobotStateSubscriber | None = None,
     prev_body_q_target: np.ndarray | None = None,
     brainco_hand=None,
-) -> tuple[np.ndarray | None, dict | None]:
-    """Send token, fetch decoded 29D qpos from g1_debug, and drive Brainco hands."""
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Publish FSQ-quantized token immediately; do not wait on any joint field.
+
+    Returns:
+        (token_qtz, left_2d, right_2d) — the exact values passed to ZMQ / hands.
+    """
+    _ = (state_sub, prev_body_q_target)  # no longer used for send completion
     if action.ndim > 1:
         action = action[0]
     token, left_2d, right_2d = split_action68(action)
     token_qtz = fsq_quantize(token)
 
-    # Body / WBC path
+    # Body / WBC path — return immediately after publish
     token_publisher.publish_token(token_qtz, left_2d, right_2d)
 
     # Brainco DDS path: 2D [thumb_aux, others] → 6D broadcast inside set_2d_targets
-    #   cmd[1] = thumb_aux
-    #   cmd[[0,2,3,4,5]] = others  (Thumb, Index, Middle, Ring, Pinky)
     if brainco_hand is not None:
         brainco_hand.set_2d_targets(left_2d, right_2d)
 
-    if state_sub is None:
-        return None, None
+    return token_qtz, left_2d, right_2d
 
-    decoded_qpos, latest_state = wait_for_body_q_target(state_sub, prev_body_q_target)
-    if decoded_qpos is None:
-        return None, latest_state
-    return decoded_qpos, latest_state
+
+def save_control_logs(
+    out_dir: Path,
+    sent_quantized_tokens: list[np.ndarray],
+    sent_timestamps: list[float],
+    body_q_action: list[np.ndarray],
+    body_q_measured: list[np.ndarray],
+) -> None:
+    """Persist per-send debug logs next to pred_actions.npy."""
+    out_dir.mkdir(parents=True, exist_ok=True)
+    if sent_quantized_tokens:
+        arr = np.stack(sent_quantized_tokens, axis=0).astype(np.float32)
+        path = out_dir / "sent_quantized_tokens.npy"
+        np.save(path, arr)
+        print(f"[SAVE] sent_quantized_tokens {arr.shape} -> {path}")
+    if sent_timestamps:
+        arr = np.asarray(sent_timestamps, dtype=np.float64)
+        path = out_dir / "sent_timestamps.npy"
+        np.save(path, arr)
+        print(f"[SAVE] sent_timestamps {arr.shape} -> {path}")
+    if body_q_action:
+        arr = np.stack(body_q_action, axis=0).astype(np.float32)
+        path = out_dir / "body_q_action.npy"
+        np.save(path, arr)
+        print(f"[SAVE] body_q_action {arr.shape} -> {path}")
+    if body_q_measured:
+        arr = np.stack(body_q_measured, axis=0).astype(np.float32)
+        path = out_dir / "body_q_measured.npy"
+        np.save(path, arr)
+        print(f"[SAVE] body_q_measured {arr.shape} -> {path}")
 
 
 def main():
@@ -774,25 +802,19 @@ def main():
     )
     parser.add_argument(
         "--save-pred-action",
-        nargs="?",
-        const="",
+        type=str,
         default=None,
-        metavar="DIR",
+        metavar="DATA_ROOT",
         help=(
-            "Save executed 68D pred trajectory (.npy + 68×1 plot). "
-            "Optional DIR (default: real/deploy/logs/pred_actions/<timestamp>)"
+            "Task dataset root, e.g. .../SONIC/walk_to_table_and_place_apple_on_pink_plate. "
+            "Writes to <DATA_ROOT>/closeloop_act_{ckpt_step}/ (pred_actions.npy + lerobot_v2.1)."
         ),
     )
     parser.add_argument(
-        "--save-pred-state",
-        nargs="?",
-        const="",
+        "--ckpt-step",
+        type=int,
         default=None,
-        metavar="DIR",
-        help=(
-            "Save decoded/postprocessed 29D qpos trajectory (.npy + 29×1 plot). "
-            "Optional DIR (default: real/deploy/logs/pred_states/<timestamp>)"
-        ),
+        help="Checkpoint step used by the ACT server (required with --save-pred-action)",
     )
     args = parser.parse_args()
 
@@ -805,27 +827,26 @@ def main():
         print("[MAIN] Rerun visualization enabled")
 
     save_pred_dir: Path | None = None
+    template_dir: Path | None = None
     if args.save_pred_action is not None:
-        if args.save_pred_action:
-            save_pred_dir = Path(args.save_pred_action)
-        else:
-            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-            save_pred_dir = _DEPLOY_DIR / "logs" / "pred_actions" / ts
+        if args.ckpt_step is None:
+            print("[MAIN] ERROR: --ckpt-step is required when using --save-pred-action")
+            return
+        data_root = Path(args.save_pred_action).expanduser().resolve()
+        save_pred_dir = resolve_closeloop_dir(data_root, args.ckpt_step)
         save_pred_dir.mkdir(parents=True, exist_ok=True)
-        print(f"[MAIN] Will save pred actions to {save_pred_dir}")
-
-    save_pred_state_dir: Path | None = None
-    if args.save_pred_state is not None:
-        if args.save_pred_state:
-            save_pred_state_dir = Path(args.save_pred_state)
-        else:
-            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-            save_pred_state_dir = _DEPLOY_DIR / "logs" / "pred_states" / ts
-        save_pred_state_dir.mkdir(parents=True, exist_ok=True)
-        print(f"[MAIN] Will save pred states to {save_pred_state_dir}")
+        template_candidate = data_root / "lerobot_v2.1"
+        if template_candidate.is_dir():
+            template_dir = template_candidate
+        print(f"[MAIN] Will save closeloop outputs to {save_pred_dir}")
+        if template_dir is not None:
+            print(f"[MAIN] lerobot template={template_dir}")
 
     pred_action_buffer: list[np.ndarray] = []
-    pred_state_buffer: list[np.ndarray] = []
+    sent_quantized_token_buffer: list[np.ndarray] = []
+    sent_timestamp_buffer: list[float] = []
+    body_q_action_buffer: list[np.ndarray] = []
+    body_q_measured_buffer: list[np.ndarray] = []
 
     policy = ACTHTTPClient(host=args.host, port=args.port)
     print(f"[MAIN] Checking ACT server at {args.host}:{args.port} ...")
@@ -850,6 +871,8 @@ def main():
     camera = ComposedCamera(address=args.camera_address, stream_key=args.camera_stream_key)
     keepalive = StreamKeepalive(token_publisher, stream_hz=max(args.freq, 30.0))
     print(f"[MAIN] Camera={args.camera_address}, image_key={IMAGE_KEY}, eef={args.eef}")
+    if DEBUG_EXECUTE_FIRST_ACTION_ONLY:
+        print("[MAIN] DEBUG_EXECUTE_FIRST_ACTION_ONLY=True → action_chunk = action_chunk[:1]")
 
     # Prep obs BEFORE STREAMED_MOTION — same as replay_real which has frames ready
     # and starts token streaming immediately after the mode switch.
@@ -900,14 +923,18 @@ def main():
     if first_actions is not None and first_actions.size:
         keepalive.set_action(first_actions[0])
     keepalive.start()
-    print(f"[MAIN] Running @ {args.freq} Hz in STREAMED_MOTION. Ctrl+C to stop.")
-    last_body_q_target: np.ndarray | None = extract_body_q_target(last_robot_state)
+    print(f"[MAIN] Running @ {args.freq} Hz (absolute schedule) in STREAMED_MOTION. Ctrl+C to stop.")
+
+    next_send_time = time.perf_counter()
 
     try:
         for step in range(args.max_steps):
             if not running.is_set():
                 break
             try:
+                # Keepalive may hold last token while we wait on ACT / state.
+                keepalive.resume()
+
                 robot_state = state_sub.get_state()
                 if robot_state is not None:
                     last_robot_state = robot_state
@@ -939,54 +966,93 @@ def main():
                     print(f"[VLA] bad action shape {actions.shape}, expected (T, {ACTION_DIM})")
                     continue
 
-                # Execute the full returned chunk at --freq (keepalive mirrors last action).
-                for i in range(actions.shape[0]):
-                    if not running.is_set():
-                        break
-                    t0 = time.perf_counter()
-                    keepalive.set_action(actions[i])
-                    pred_state29, post_state = execute_action68(
-                        actions[i],
-                        token_publisher,
-                        state_sub=state_sub,
-                        prev_body_q_target=last_body_q_target,
-                        brainco_hand=brainco_hand,
-                    )
-                    if post_state is not None:
-                        last_robot_state = post_state
-                    if pred_state29 is not None:
-                        last_body_q_target = pred_state29.copy()
-                        if save_pred_state_dir is not None:
-                            pred_state_buffer.append(pred_state29.astype(np.float32, copy=True))
-                    elif save_pred_state_dir is not None and step % 10 == 0 and i == 0:
-                        print("[VLA] warning: missing body_q_target for pred-state logging")
-                    if save_pred_dir is not None:
-                        pred_action_buffer.append(np.asarray(actions[i], dtype=np.float32).reshape(-1)[:ACTION_DIM])
-                    if rerun_logger is not None and last_vis_frame is not None:
-                        visualization_data(
-                            rerun_idx,
-                            _observation_for_rerun(last_vis_frame),
-                            _state_for_rerun(states),
-                            _action_for_rerun(actions[i]),
-                            rerun_logger,
+                action_chunk = actions
+                if DEBUG_EXECUTE_FIRST_ACTION_ONLY:
+                    action_chunk = action_chunk[:1]
+
+                # Main thread owns token PUB while executing the chunk.
+                keepalive.pause()
+                try:
+                    for i in range(action_chunk.shape[0]):
+                        if not running.is_set():
+                            break
+
+                        now = time.perf_counter()
+                        if now < next_send_time:
+                            time.sleep(next_send_time - now)
+
+                        raw_action = np.asarray(action_chunk[i], dtype=np.float32).reshape(-1)[
+                            :ACTION_DIM
+                        ]
+                        send_t = time.perf_counter()
+                        token_qtz, left_2d, right_2d = execute_action68(
+                            raw_action,
+                            token_publisher,
+                            brainco_hand=brainco_hand,
                         )
-                        rerun_idx += 1
-                    if step % 10 == 0 and i == 0:
-                        _, l2, r2 = split_action68(actions[0])
-                        print(
-                            f"[VLA] step={step} chunk={actions.shape} "
-                            f"token[:3]={actions[0, :3]} left_2d={l2} right_2d={r2}"
-                        )
-                    elapsed = time.perf_counter() - t0
-                    sleep_t = dt - elapsed
-                    if sleep_t > 0:
-                        time.sleep(sleep_t)
+                        keepalive.set_last_sent(token_qtz, left_2d, right_2d)
+
+                        # Snapshot WBC / robot joints (no wait-for-change).
+                        post_state = state_sub.get_state()
+                        if post_state is not None:
+                            last_robot_state = post_state
+                        else:
+                            post_state = last_robot_state
+
+                        q_action = extract_body_q_action(post_state)
+                        q_measured = extract_body_q_measured(post_state)
+
+                        if save_pred_dir is not None:
+                            pred_action_buffer.append(raw_action.copy())
+                            sent_quantized_token_buffer.append(
+                                np.asarray(token_qtz, dtype=np.float32).reshape(-1)[:TOKEN_DIM].copy()
+                            )
+                            sent_timestamp_buffer.append(float(send_t))
+                            if q_action is not None:
+                                body_q_action_buffer.append(q_action.astype(np.float32, copy=True))
+                            if q_measured is not None:
+                                body_q_measured_buffer.append(q_measured.astype(np.float32, copy=True))
+
+                        if rerun_logger is not None and last_vis_frame is not None:
+                            visualization_data(
+                                rerun_idx,
+                                _observation_for_rerun(last_vis_frame),
+                                _state_for_rerun(states),
+                                _action_for_rerun(raw_action),
+                                rerun_logger,
+                            )
+                            rerun_idx += 1
+
+                        if step % 10 == 0 and i == 0:
+                            print(
+                                f"[VLA] step={step} chunk={actions.shape} exec={action_chunk.shape} "
+                                f"token_qtz[:3]={token_qtz[:3]} left_2d={left_2d} right_2d={right_2d}"
+                            )
+
+                        # Absolute 30 Hz schedule (avoid cumulative drift from per-step elapsed).
+                        next_send_time += dt
+                        if next_send_time < time.perf_counter() - dt:
+                            next_send_time = time.perf_counter() + dt
+                finally:
+                    # Always clear "executing chunk" so keepalive cannot stay paused forever.
+                    keepalive.resume()
+
             except Exception as e:
                 print(f"[VLA] step {step} failed: {e}")
-                time.sleep(dt)
+                try:
+                    keepalive.resume()
+                except Exception:
+                    pass
+                # Resync schedule after a failed step
+                next_send_time = time.perf_counter() + dt
+                time.sleep(min(dt, 0.05))
     finally:
         print("[MAIN] Shutting down...")
         running.clear()
+        try:
+            keepalive.resume()
+        except Exception:
+            pass
         keepalive.stop()
         try:
             token_publisher.handoff_to_idle_planner(hold_seconds=2.0)
@@ -1001,18 +1067,32 @@ def main():
         state_sub.stop()
         if save_pred_dir is not None and pred_action_buffer:
             try:
-                save_pred_action_trajectory(np.stack(pred_action_buffer, axis=0), save_pred_dir)
+                pred = np.stack(pred_action_buffer, axis=0)
+                save_pred_action_trajectory(pred, save_pred_dir)
+                # Optional body states for lerobot (pad to 33D inside writer)
+                states_for_lerobot = None
+                if body_q_measured_buffer and len(body_q_measured_buffer) == pred.shape[0]:
+                    states_for_lerobot = np.stack(body_q_measured_buffer, axis=0)
+                write_pred_lerobot(
+                    out_dir=save_pred_dir,
+                    actions=pred,
+                    states=states_for_lerobot,
+                    fps=int(round(args.freq)),
+                    instruction=args.instruction,
+                    template_dir=template_dir,
+                    keep_videos=False,
+                )
+                save_control_logs(
+                    save_pred_dir,
+                    sent_quantized_token_buffer,
+                    sent_timestamp_buffer,
+                    body_q_action_buffer,
+                    body_q_measured_buffer,
+                )
             except Exception as e:
-                print(f"[SAVE] failed to save pred actions: {e}")
+                print(f"[SAVE] failed to save closeloop outputs: {e}")
         elif save_pred_dir is not None:
             print("[SAVE] no pred actions recorded")
-        if save_pred_state_dir is not None and pred_state_buffer:
-            try:
-                save_pred_state_trajectory(np.stack(pred_state_buffer, axis=0), save_pred_state_dir)
-            except Exception as e:
-                print(f"[SAVE] failed to save pred states: {e}")
-        elif save_pred_state_dir is not None:
-            print("[SAVE] no pred states recorded")
         print("[MAIN] Shutdown complete.")
 
 if __name__ == "__main__":
