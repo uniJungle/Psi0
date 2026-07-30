@@ -52,6 +52,12 @@ python real/deploy/act_inference.py \
   --visualization \
   --save-pred-action /home/karthus_chen/ycb_ws/datasets/SONIC/walk_to_table_and_place_apple_on_pink_plate/closeloop_act_40k \
   --save-pred-state /home/karthus_chen/ycb_ws/datasets/SONIC/walk_to_table_and_place_apple_on_pink_plate/closeloop_act_40k
+
+# 将 pred_actions.npy 转为 lerobot_v2.1，供 replay_real 回放
+python scripts/data/pred_npy_to_lerobot.py \
+  --pred-dir /home/karthus_chen/ycb_ws/datasets/SONIC/walk_to_table_and_place_apple_on_pink_plate/closeloop_act_40k \
+  --output-dir /home/karthus_chen/ycb_ws/datasets/SONIC/walk_to_table_and_place_apple_on_pink_plate/closeloop_act_40k/lerobot_v2.1 \
+  --instruction "walk to table and place apple on pink plate"
 ```
 
 ### Open-loop Inference
@@ -76,8 +82,6 @@ python baselines/act/openloop_act_g1_real.py \
   --n-action-steps 50 \
   --host localhost \
   --port 22085
-# rollout: t=0 用 GT obs 推理 → 写入 chunk[0:49] 到 frame 0..49 → t=50 再推理 …
-# serve 的 --n-action-steps 应 >= 客户端 --n-action-steps
 
 # 终端 3：回放 pred action:
 cd ~/ycb_ws/Psi0/
@@ -89,7 +93,7 @@ python scripts/replay/replay_real.py \
   --zmq_port 5556 \
   --eef brainco \
   --mode token \
-  --data_dir /home/karthus_chen/ycb_ws/datasets/SONIC/walk_to_table_and_place_apple_on_pink_plate/openloop_act/episode_000099 \
+  --data_dir /home/karthus_chen/ycb_ws/datasets/SONIC/walk_to_table_and_place_apple_on_pink_plate/closeloop_act_40k/lerobot_v2.1 \
   --episode_idx 0
 ```
 

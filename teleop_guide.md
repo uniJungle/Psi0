@@ -170,12 +170,12 @@ source .venv-psi/bin/activate
 
 python scripts/replay/replay_real.py \
   --input_type zmq_manager \
-  --dds-interface enp4s0 \
+  --dds-interface enp5s0 \
   --zmq_port 5556 \
   --eef brainco \
   --mode token \
-  --data_dir /home/karthus_chen/ycb_ws/datasets/SONIC/walk_to_table_and_place_apple_on_pink_plate \
-  --episode_idx 39
+  --data_dir /home/karthus_chen/ycb_ws/datasets/SONIC/walk_to_table_and_place_apple_on_pink_plate/closeloop_act_40k/lerobot_v2.1 \
+  --episode_idx 0
 ```
 
 ## 数据后处理
