@@ -111,7 +111,11 @@ def _dim_label(dim: int) -> str:
     return f"action[{dim}] {name}"
 
 
-def save_pred_action_trajectory(pred: np.ndarray, out_dir: Path) -> None:
+def save_pred_action_trajectory(
+    pred: np.ndarray,
+    out_dir: Path,
+    title: str = "ACT closed-loop pred",
+) -> None:
     """Save executed 68D pred trajectory: pred_actions.npy + 68×1 plot."""
     pred = np.asarray(pred, dtype=np.float32)
     save_pred_actions_npy(out_dir, pred)
@@ -137,7 +141,7 @@ def save_pred_action_trajectory(pred: np.ndarray, out_dir: Path) -> None:
         ax.grid(True, alpha=0.25)
         if dim == 0:
             ax.legend(loc="upper right", fontsize=7)
-            ax.set_title(f"ACT closed-loop pred  |  all {ACTION_DIM} dims", fontsize=11)
+            ax.set_title(f"{title}  |  all {ACTION_DIM} dims", fontsize=11)
 
     axes[-1].set_xlabel("frame index", fontsize=9)
     plot_path = plots_dir / "closedloop_pred_all_dims.png"

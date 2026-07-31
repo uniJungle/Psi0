@@ -108,10 +108,11 @@ class Server:
             # )
 
             if self.maxmin.normalize_state: # type:ignore
+                states_np = states.numpy()
+                if self.maxmin.pad_state_dim is not None:
+                    states_np = pad_to_len(states_np, self.maxmin.pad_state_dim, dim=1)[0]
                 states = torch.from_numpy(
-                    self.maxmin.normalize_state_func(
-                        pad_to_len(states.numpy(), self.maxmin.pad_state_dim, dim=1)[0]
-                    )
+                    self.maxmin.normalize_state_func(states_np)
                 ).to(self.device)
 
             if not self.enable_rtc:
@@ -166,7 +167,7 @@ class Server:
         except Exception as e:
             import traceback
             overwatch.warning(traceback.format_exc())
-            return JSONResponse(content=f'{{"status": "{e}"}}')
+            return JSONResponse(content={"status": str(e), "error": str(e)})
 
     
     def run(self, host: str = "0.0.0.0", port: int = 8000) -> None:
@@ -201,12 +202,12 @@ def main():
     overwatch.info("Start Serving from uv")
     overwatch.info(f"Args: {sys.argv}")
     from dotenv import load_dotenv
-    assert load_dotenv() 
+    load_dotenv()
     config = tyro.cli(ServerConfig, config=(tyro.conf.ConsolidateSubcommandArgs,), args=sys.argv[1:])
     serve(config)
 
 if __name__ == "__main__":
     from dotenv import load_dotenv
-    assert load_dotenv()
+    load_dotenv()
     config = tyro.cli(ServerConfig, config=(tyro.conf.ConsolidateSubcommandArgs,))
     serve(config)

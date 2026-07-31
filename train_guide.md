@@ -76,7 +76,137 @@ python real/deploy/act_inference.py \
   --save-pred-action /home/karthus_chen/ycb_ws/datasets/SONIC/walk_to_table_and_place_apple_on_pink_plate
 ```
 
-### 数据回放
+## Psi0
+### 训练
+```bash
+# Launch the training script via tmux
+tmux new -s train_psi0
+cd /sh/zzy/Psi0
+export WANDB_API_KEY='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'
+wandb login
+bash train_psi0.sh
+```
+
+### 开环推理
+```bash
+# 终端 1：启动 Psi0 policy server（HTTP :22085）
+cd /home/karthus_chen/ycb_ws/Psi0
+source .venv-psi/bin/activate
+
+bash scripts/deploy/serve_psi0_simple.sh \
+  /home/karthus_chen/ycb_ws/checkpoints/PSI0_40k_g1_sonic_walk_to_table_and_place_apple_on_pink_plate_100 \
+  40000
+
+# 终端 2：启动开环推理端
+cd /home/karthus_chen/ycb_ws/Psi0
+source .venv-psi/bin/activate
+
+python baselines/psi0/openloop_psi0_g1_real.py \
+  --data-root /home/karthus_chen/ycb_ws/datasets/SONIC/walk_to_table_and_place_apple_on_pink_plate \
+  --ckpt-step 40000 \
+  --episode-idx 1 \
+  --n-action-steps 1 \
+  --host localhost \
+  --port 22085
+```
+
+### 闭环推理
+```bash
+# 终端 1：G1 机载 Brainco hand + SONIC composed_camera（PUB :5555）
+ssh unitree@192.168.123.164
+bash ./sonic_start_teleop.sh
+
+# 终端 2：SONIC C++ deploy（--input-type zmq_manager，订阅 :5556）
+cd /home/karthus_chen/ycb_ws/Psi0
+bash ./real/SONIC/scripts/collect_psi0-sonic-data-manual.sh deploy
+
+# 终端 3：enable_control 进入 PLANNER 并站稳，然后释放 :5556
+cd /home/karthus_chen/ycb_ws/Psi0
+source .venv-psi/bin/activate
+
+python scripts/replay/enable_control.py
+
+# 终端 4：启动 Psi0 policy server（RTC WebSocket :8014）
+cd /home/karthus_chen/ycb_ws/Psi0
+source .venv-psi/bin/activate
+
+export CHECKPOINT_DIR=/home/karthus_chen/ycb_ws/checkpoints/PSI0_40k_g1_sonic_walk_to_table_and_place_apple_on_pink_plate_100
+export CHECKPOINT_STEP=40000
+bash ./scripts/deploy/serve_psi0-rtc-sonic.sh
+
+# 终端 5：Psi0 RTC client（WebSocket → 68D action → token + Brainco DDS）
+cd /home/karthus_chen/ycb_ws/Psi0
+source third_party/GR00T-WholeBodyControl/.venv_teleop/bin/activate
+
+python real/deploy/psi_inference.py \
+  --host localhost \
+  --port 8014 \
+  --camera-address tcp://192.168.123.164:5555 \
+  --eef brainco \
+  --dds-interface enp5s0 \
+  --instruction "Go to the table, pick up the apple, place the apple on the pink plate." \
+  --ckpt-step 40000 \
+  --save-pred-action /home/karthus_chen/ycb_ws/datasets/SONIC/walk_to_table_and_place_apple_on_pink_plate
+```
+
+## GR00T-N1.7
+
+### 开环推理
+```bash
+# 终端 1：启动 GR00T-N1.7 PolicyServer（ZMQ :5555）
+cd /home/karthus_chen/ycb_ws/Psi0
+bash baselines/gr00t-n1.7/serve_gr00t_n1d7_sonic.sh \
+  --model-path /home/karthus_chen/ycb_ws/checkpoints/GR00T_N1d7_40k_g1_sonic_walk_to_table_place_apple_on_pink_plate_100
+
+# 终端 2：启动开环推理端
+cd /home/karthus_chen/ycb_ws/Psi0
+source /home/karthus_chen/ycb_ws/GR00T/.venv/bin/activate
+
+python baselines/gr00t-n1.7/openloop_gr00t_n1d7_g1_real.py \
+  --data-root /home/karthus_chen/ycb_ws/datasets/SONIC/walk_to_table_and_place_apple_on_pink_plate \
+  --ckpt-step 40000 \
+  --episode-idx 1 \
+  --n-action-steps 1 \
+  --host localhost \
+  --port 5555
+```
+
+### 闭环推理
+```bash
+# 终端 1：G1 机载 Brainco hand + SONIC composed_camera（PUB :5555，stereo）
+ssh unitree@192.168.123.164
+bash ./sonic_start_teleop.sh
+
+# 终端 2：SONIC C++ deploy（--input-type zmq_manager，订阅 :5556）
+cd /home/karthus_chen/ycb_ws/Psi0
+bash ./real/SONIC/scripts/collect_psi0-sonic-data-manual.sh deploy
+
+# 终端 3：enable_control 进入 PLANNER 并站稳，然后释放 :5556
+cd /home/karthus_chen/ycb_ws/Psi0
+source .venv-psi/bin/activate
+python scripts/replay/enable_control.py
+
+# 终端 4：启动 GR00T-N1.7 PolicyServer（ZMQ :5555）
+cd /home/karthus_chen/ycb_ws/Psi0
+bash baselines/gr00t-n1.7/serve_gr00t_n1d7_sonic.sh \
+  --model-path /home/karthus_chen/ycb_ws/checkpoints/GR00T_N1d7_40k_g1_sonic_walk_to_table_place_apple_on_pink_plate_100
+
+# 终端 5：GR00T client（stereo 相机 → 68D → token ZMQ + Brainco DDS）
+cd /home/karthus_chen/ycb_ws/Psi0
+source third_party/GR00T-WholeBodyControl/.venv_teleop/bin/activate
+
+python real/deploy/gr00t_n1d7_inference.py \
+  --host localhost \
+  --port 5555 \
+  --camera-address tcp://192.168.123.164:5555 \
+  --eef brainco \
+  --dds-interface enp5s0 \
+  --instruction "Go to the table, pick up the apple, place the apple on the pink plate." \
+  --ckpt-step 40000 \
+  --save-pred-action /home/karthus_chen/ycb_ws/datasets/SONIC/walk_to_table_and_place_apple_on_pink_plate
+```
+
+## 数据回放
 ```bash
 # 终端 1：启动 C++ deploy 的 sim 模式
 cd ~/ycb_ws/Psi0/
@@ -101,17 +231,8 @@ python scripts/replay/replay_real.py \
   --episode_idx 0 \
   --data_dir /home/karthus_chen/ycb_ws/datasets/SONIC/walk_to_table_and_place_apple_on_pink_plate/openloop_act_40000/episode_000001
 
-# 闭环回放路径
---data_dir /home/karthus_chen/ycb_ws/datasets/SONIC/walk_to_table_and_place_apple_on_pink_plate/closeloop_act_40000
-```
-
-## Psi0
-### Training
-```bash
-# Launch the training script via tmux
-tmux new -s train_psi0
-cd /sh/zzy/Psi0
-export WANDB_API_KEY='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'
-wandb login
-bash train_psi0.sh
+# 闭环回放路径示例
+# --data_dir .../closeloop_act_40000
+# --data_dir .../closeloop_psi0_40000
+# --data_dir .../closeloop_gr00t_n1d7_40000
 ```

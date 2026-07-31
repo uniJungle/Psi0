@@ -1,14 +1,25 @@
 #!/bin/bash
+set -euo pipefail
 
-PORT=8014
-# INSTRUCTION="Spray the bowl and wipe it and stack it up."
-# INSTRUCTION="Pick toys into box and lift and turn and put on the chair new"
-INSTRUCTION="pick up the green grapes and place it into the green bowl"
+# Psi0 RTC client for SONIC + Brainco (33D state / 68D action).
+# Run AFTER: robot camera, C++ deploy, enable_control.py, and serve_psi0-rtc-sonic.sh
 
-# psi_rtc_sonic_client.py lives at the GR00T-WholeBodyControl (sonic) submodule root
-cd "$(dirname "$0")/../../third_party/GR00T-WholeBodyControl"
+PSI0_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
+cd "$PSI0_ROOT"
 
-# Run in SONIC's .venv_teleop (has gear_sonic + cv2 + zmq + msgpack; websocket-client added for the psi0 RTC client)
-./.venv_teleop/bin/python psi_rtc_sonic_client.py \
+PORT="${PORT:-8014}"
+HOST="${HOST:-localhost}"
+INSTRUCTION="${INSTRUCTION:-walk to table and place apple on pink plate}"
+CAMERA_ADDRESS="${CAMERA_ADDRESS:-tcp://192.168.123.164:5555}"
+DDS_INTERFACE="${DDS_INTERFACE:-enp5s0}"
+EEF="${EEF:-brainco}"
+
+source third_party/GR00T-WholeBodyControl/.venv_teleop/bin/activate
+
+python real/deploy/psi_inference.py \
+    --host "$HOST" \
     --port "$PORT" \
-    --instruction "$INSTRUCTION"
+    --instruction "$INSTRUCTION" \
+    --camera-address "$CAMERA_ADDRESS" \
+    --eef "$EEF" \
+    --dds-interface "$DDS_INTERFACE"

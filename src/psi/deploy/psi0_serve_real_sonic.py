@@ -103,10 +103,11 @@ class Server:
             states = torch.from_numpy(state_dict["states"].copy())
 
             if self.maxmin.normalize_state: # type:ignore
+                states_np = states.numpy()
+                if self.maxmin.pad_state_dim is not None:
+                    states_np = pad_to_len(states_np, self.maxmin.pad_state_dim, dim=1)[0]
                 states = torch.from_numpy(
-                    self.maxmin.normalize_state_func(
-                        pad_to_len(states.numpy(), self.maxmin.pad_state_dim, dim=1)[0]
-                    )
+                    self.maxmin.normalize_state_func(states_np)
                 ).to(self.device)
 
             if not self.enable_rtc:

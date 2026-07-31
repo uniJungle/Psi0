@@ -32,8 +32,14 @@ def resolve_openloop_dir(data_root: Path, ckpt_step: int, episode_idx: int) -> P
     return Path(data_root) / f"openloop_act_{int(ckpt_step)}" / f"episode_{int(episode_idx):06d}"
 
 
-def resolve_closeloop_dir(data_root: Path, ckpt_step: int) -> Path:
-    return Path(data_root) / f"closeloop_act_{int(ckpt_step)}"
+def resolve_closeloop_dir(
+    data_root: Path, ckpt_step: int, prefix: str = "act"
+) -> Path:
+    """Closed-loop output dir: ``closeloop_{prefix}_{ckpt_step}/``.
+
+    ``prefix`` examples: ``act``, ``psi0``, ``gr00t_n1d7``.
+    """
+    return Path(data_root) / f"closeloop_{prefix}_{int(ckpt_step)}"
 
 
 def save_pred_actions_npy(out_dir: Path, actions: np.ndarray) -> Path:

@@ -22,5 +22,4 @@ serve_psi0 \
     --policy=psi0 \
     --run-dir=$RUN_DIR \
     --ckpt-step=$CKPT_STEP \
-    --action-exec-horizon=24 \
-    --rtc
+    --action-exec-horizon=24
