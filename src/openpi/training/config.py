@@ -418,6 +418,10 @@ class RLDSDroidDataConfig(DataConfigFactory):
 class LeRobotHFMDataConfig(DataConfigFactory):
     """ HFM data config for LeRobot format. 
     """
+    # Camera key in the LeRobot dataset, mapped to observation/image.
+    # Sonic G1 uses observation.images.egocentric_right (ego_view_right).
+    image_key: str = "observation.images.egocentric"
+
     # # not works
     # base_config: tyro.conf.Suppress[DataConfig | None] = dataclasses.field(default_factory=lambda: DataConfig(
     #     action_sequence_keys=("action",)
@@ -432,7 +436,7 @@ class LeRobotHFMDataConfig(DataConfigFactory):
         repack_transform = _transforms.Group(
             inputs=[
                 _transforms.RepackTransform({
-                    "observation/image": "observation.images.egocentric",
+                    "observation/image": self.image_key,
 
                     # "observation/arm_joints": "observation.arm_joints",
                     # "observation/hand_joints": "observation.hand_joints",
@@ -1390,6 +1394,42 @@ _CONFIGS = [
         pytorch_weight_path=f"{os.environ['PSI_HOME']}/cache/checkpoints/openpi/pi05_droid",
         policy_metadata={"dataset": "G1WholebodyTabletopGraspMP-v0"},
         checkpoint_base_dir=f".runs/openpi-05"
+    ),
+    ### Sonic G1 real: walk_to_table_and_place_apple_on_pink_plate_100 ###
+    # PyTorch path freezes PaliGemma VLM and trains action expert (Psi0 default low-mem finetune).
+    # True gemma_*_lora is JAX-only in this codebase; pytorch train_pytorch.py uses VLM freeze instead.
+    TrainConfig(
+        name="walk_to_table_and_place_apple_on_pink_plate_100",
+        project_name="psi",
+        num_workers=8,
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=68,
+            action_horizon=32,
+            max_token_len=250,
+        ),
+        data=LeRobotHFMDataConfig(
+            repo_id="/sh/datasets/g1/sonic/walk_to_table_and_place_apple_on_pink_plate_100/lerobot_v2.1",
+            image_key="observation.images.egocentric_right",
+            assets=AssetsConfig(asset_id="walk_to_table_and_place_apple_on_pink_plate_100"),
+            base_config=DataConfig(prompt_from_task=True),
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        num_train_steps=40_000,
+        batch_size=128,
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=1e-4,
+            decay_steps=40_000,
+            decay_lr=1e-8,
+        ),
+        # Converted from local JAX pi05_base under OPENPI_DATA_HOME=/sh/ycb/.cache/openpi
+        pytorch_weight_path="/sh/ycb/.cache/openpi/openpi-assets/checkpoints/pi05_base_pytorch",
+        policy_metadata={"dataset": "walk_to_table_and_place_apple_on_pink_plate_100"},
+        assets_base_dir="/sh/zzy/.cache/openpi/assets",
+        checkpoint_base_dir="/sh/zzy/checkpoints/openpi-05",
+        # EMA not used in pytorch trainer; keep None for clarity with low-mem / VLM-freeze finetune
+        ema_decay=None,
     ),
     
     #

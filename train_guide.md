@@ -10,6 +10,11 @@ cd /sh/zzy/Psi0
 export WANDB_API_KEY='your-wandb-api-key'
 wandb login
 bash train_act.sh
+
+# Detach / reattach tmux
+Detach: Ctrl-b then d
+Reattach: tmux attach -t train_act
+List sessions: tmux ls
 ```
 
 ### 开环推理
@@ -85,6 +90,11 @@ cd /sh/zzy/Psi0
 export WANDB_API_KEY='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'
 wandb login
 bash train_psi0.sh
+
+# Detach / reattach tmux
+Detach: Ctrl-b then d
+Reattach: tmux attach -t train_psi0
+List sessions: tmux ls
 ```
 
 ### 开环推理
@@ -151,6 +161,21 @@ python real/deploy/psi_inference.py \
 
 ## GR00T-N1.7
 
+### 训练
+```bash
+# Launch the training script via tmux
+tmux new -s train_gr00t
+cd /sh/zzy/Psi0
+export WANDB_API_KEY='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'
+wandb login
+bash train_gr00t.sh
+
+# Detach / reattach tmux
+Detach: Ctrl-b then d
+Reattach: tmux attach -t train_gr00t
+List sessions: tmux ls
+```
+
 ### 开环推理
 ```bash
 # 终端 1：启动 GR00T-N1.7 PolicyServer（ZMQ :5555）
@@ -206,33 +231,30 @@ python real/deploy/gr00t_n1d7_inference.py \
   --save-pred-action /home/karthus_chen/ycb_ws/datasets/SONIC/walk_to_table_and_place_apple_on_pink_plate
 ```
 
-## 数据回放
+## Pi-0.5
+
+### 训练
 ```bash
-# 终端 1：启动 C++ deploy 的 sim 模式
-cd ~/ycb_ws/Psi0/
-bash ./real/SONIC/scripts/collect_psi0-sonic-data-manual.sh deploy
+# Launch the training script via tmux
+tmux new -s train_pi05
+cd /sh/zzy/Psi0
+export WANDB_API_KEY='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'
+wandb login
+bash train_pi05.sh
 
-# 终端 2：进入规划模式保持 IDLE 模式
-cd ~/ycb_ws/Psi0/
-source .venv-psi/bin/activate
+# Detach / reattach tmux
+Detach: Ctrl-b then d
+Reattach: tmux attach -t train_gr00t
+List sessions: tmux ls
 
-python scripts/replay/enable_control.py
+```
 
-# 终端 3：发送回放
-cd ~/ycb_ws/Psi0/
-source .venv-psi/bin/activate
+### 开环推理
+```bash
 
-python scripts/replay/replay_real.py \
-  --input_type zmq_manager \
-  --dds-interface enp5s0 \
-  --zmq_port 5556 \
-  --eef brainco \
-  --mode token \
-  --episode_idx 0 \
-  --data_dir /home/karthus_chen/ycb_ws/datasets/SONIC/walk_to_table_and_place_apple_on_pink_plate/openloop_act_40000/episode_000001
+```
 
-# 闭环回放路径示例
-# --data_dir .../closeloop_act_40000
-# --data_dir .../closeloop_psi0_40000
-# --data_dir .../closeloop_gr00t_n1d7_40000
+### 闭环推理
+```bash
+
 ```

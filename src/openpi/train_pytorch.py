@@ -475,26 +475,45 @@ def train_loop(config: _config.TrainConfig):
         logging.info(f"Loading weights from: {config.pytorch_weight_path}")
 
         model_path = os.path.join(config.pytorch_weight_path, "model.safetensors")
-        # Psi-0: adapt action dim to 36
+        # Psi-0: pad action proj from pretrained dim (e.g. 32) to config.action_dim (e.g. 36/68)
         from safetensors.torch import load_file
         state_dict = load_file(model_path)
-        pad_dim = config.model.action_dim - state_dict["action_in_proj.weight"].shape[1]
+        ckpt_dim = state_dict["action_in_proj.weight"].shape[1]
+        target_dim = config.model.action_dim
+        pad_dim = target_dim - ckpt_dim
         if pad_dim > 0:
-            # eg., torch.Size([1024, 32]) -> torch.Size([1024, 36])
-            # Replicate the last 4 columns instead of padding with zeros
+            # Repeat trailing columns until we reach target_dim (handles pad_dim > ckpt_dim).
             w = state_dict["action_in_proj.weight"]
-            to_pad = w[:, -pad_dim:]
-            # to_pad = torch.zeros_like(w[:, -pad_dim:])
-            state_dict["action_in_proj.weight"] = torch.cat([w, to_pad], dim=1)
+            pieces = [w]
+            remaining = pad_dim
+            while remaining > 0:
+                take = min(remaining, ckpt_dim)
+                pieces.append(w[:, -take:])
+                remaining -= take
+            state_dict["action_in_proj.weight"] = torch.cat(pieces, dim=1)
 
             b = state_dict["action_out_proj.bias"]
-            # b = torch.zeros_like(state_dict["action_out_proj.bias"])
-            state_dict["action_out_proj.bias"] = torch.cat([b, b[-pad_dim:]], dim=0)
+            pieces = [b]
+            remaining = pad_dim
+            while remaining > 0:
+                take = min(remaining, ckpt_dim)
+                pieces.append(b[-take:])
+                remaining -= take
+            state_dict["action_out_proj.bias"] = torch.cat(pieces, dim=0)
 
             w = state_dict["action_out_proj.weight"]
-            to_pad = w[-pad_dim:, :]
-            # to_pad = torch.zeros_like(w[-pad_dim:, :])
-            state_dict["action_out_proj.weight"] = torch.cat([w, to_pad], dim=0)
+            pieces = [w]
+            remaining = pad_dim
+            while remaining > 0:
+                take = min(remaining, ckpt_dim)
+                pieces.append(w[-take:, :])
+                remaining -= take
+            state_dict["action_out_proj.weight"] = torch.cat(pieces, dim=0)
+            logging.info(f"Padded action proj {ckpt_dim} -> {target_dim}")
+        elif pad_dim < 0:
+            raise ValueError(
+                f"Checkpoint action dim {ckpt_dim} > config.action_dim {target_dim}; cannot shrink."
+            )
 
         # https://github.com/Physical-Intelligence/openpi/issues/669
         state_dict["paligemma_with_expert.paligemma.model.language_model.embed_tokens.weight"] = \
