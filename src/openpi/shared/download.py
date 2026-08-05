@@ -23,9 +23,23 @@ logger = logging.getLogger(__name__)
 
 def get_cache_dir() -> pathlib.Path:
     cache_dir = pathlib.Path(os.getenv(_OPENPI_DATA_HOME, DEFAULT_CACHE_DIR)).expanduser().resolve()
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    _set_folder_permission(cache_dir)
-    return cache_dir
+    try:
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        _set_folder_permission(cache_dir)
+        return cache_dir
+    except OSError as exc:
+        fallback = pathlib.Path(DEFAULT_CACHE_DIR).expanduser().resolve()
+        if fallback == cache_dir:
+            raise
+        logger.warning(
+            "Cannot use OPENPI_DATA_HOME=%s (%s); falling back to %s",
+            cache_dir,
+            exc,
+            fallback,
+        )
+        fallback.mkdir(parents=True, exist_ok=True)
+        _set_folder_permission(fallback)
+        return fallback
 
 
 def maybe_download(url: str, *, force_download: bool = False, **kwargs) -> pathlib.Path:
@@ -67,6 +81,11 @@ def maybe_download(url: str, *, force_download: bool = False, **kwargs) -> pathl
         else:
             return local_path
 
+    fallback_path = _offline_fallback_path(url, local_path)
+    if fallback_path is not None and fallback_path.exists() and not force_download and not invalidate_cache:
+        logger.info(f"Using offline fallback for {url}: {fallback_path}")
+        return fallback_path.resolve()
+
     try:
         lock_path = local_path.with_suffix(".lock")
         with filelock.FileLock(lock_path):
@@ -80,10 +99,19 @@ def maybe_download(url: str, *, force_download: bool = False, **kwargs) -> pathl
                 else:
                     local_path.unlink()
 
+            if local_path.exists() and not force_download:
+                return local_path
+
             # Download the data to a local cache.
             logger.info(f"Downloading {url} to {local_path}")
             scratch_path = local_path.with_suffix(".partial")
-            _download_fsspec(url, scratch_path, **kwargs)
+            try:
+                _download_fsspec(url, scratch_path, **kwargs)
+            except Exception:
+                if fallback_path is not None and fallback_path.exists():
+                    logger.warning(f"Download failed for {url}; using offline fallback {fallback_path}")
+                    return fallback_path.resolve()
+                raise
 
             shutil.move(scratch_path, local_path)
             _ensure_permissions(local_path)
@@ -93,9 +121,28 @@ def maybe_download(url: str, *, force_download: bool = False, **kwargs) -> pathl
             f"Local file permission error was encountered while downloading {url}. "
             f"Please try again after removing the cached data using: `rm -rf {local_path}*`"
         )
+        if fallback_path is not None and fallback_path.exists():
+            logger.warning(f"{msg} Falling back to {fallback_path}")
+            return fallback_path.resolve()
         raise PermissionError(msg) from e
 
     return local_path
+
+
+def _offline_fallback_path(url: str, local_path: pathlib.Path) -> pathlib.Path | None:
+    parsed = urllib.parse.urlparse(url)
+    if parsed.path.endswith("paligemma_tokenizer.model"):
+        candidates = [
+            os.getenv("OPENPI_PALIGEMMA_TOKENIZER"),
+            str(local_path),
+            os.path.join(os.path.expanduser(DEFAULT_CACHE_DIR), "big_vision", "paligemma_tokenizer.model"),
+            "/home/karthus_chen/.cache/openpi/big_vision/paligemma_tokenizer.model",
+            "/home/karthus_chen/ycb_ws/model/pi05_base/paligemma_tokenizer.model",
+        ]
+        for candidate in candidates:
+            if candidate and pathlib.Path(candidate).exists():
+                return pathlib.Path(candidate)
+    return None
 
 
 def _download_fsspec(url: str, local_path: pathlib.Path, **kwargs) -> None:

@@ -15,7 +15,13 @@ class PaligemmaTokenizer:
     def __init__(self, max_len: int = 48):
         self._max_len = max_len
 
-        path = download.maybe_download("gs://big_vision/paligemma_tokenizer.model", gs={"token": "anon"})
+        local_tokenizer = os.getenv("OPENPI_PALIGEMMA_TOKENIZER")
+        if local_tokenizer:
+            path = download.maybe_download(local_tokenizer)
+        else:
+            path = download.maybe_download(
+                "gs://big_vision/paligemma_tokenizer.model", gs={"token": "anon"}
+            )
         with path.open("rb") as f:
             self._tokenizer = sentencepiece.SentencePieceProcessor(model_proto=f.read())
 
@@ -53,7 +59,13 @@ class FASTTokenizer:
         self._max_len = max_len
 
         # Download base PaliGemma tokenizer
-        path = download.maybe_download("gs://big_vision/paligemma_tokenizer.model", gs={"token": "anon"})
+        local_tokenizer = os.getenv("OPENPI_PALIGEMMA_TOKENIZER")
+        if local_tokenizer:
+            path = download.maybe_download(local_tokenizer)
+        else:
+            path = download.maybe_download(
+                "gs://big_vision/paligemma_tokenizer.model", gs={"token": "anon"}
+            )
         with path.open("rb") as f:
             self._paligemma_tokenizer = sentencepiece.SentencePieceProcessor(model_proto=f.read())
 

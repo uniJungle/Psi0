@@ -228,6 +228,7 @@ python real/deploy/gr00t_n1d7_inference.py \
   --dds-interface enp5s0 \
   --instruction "Go to the table, pick up the apple, place the apple on the pink plate." \
   --ckpt-step 40000 \
+  --execute-horizon 20 \
   --save-pred-action /home/karthus_chen/ycb_ws/datasets/SONIC/walk_to_table_and_place_apple_on_pink_plate
 ```
 
@@ -251,10 +252,63 @@ List sessions: tmux ls
 
 ### 开环推理
 ```bash
+# 终端 1：启动 π0.5 PolicyServer（WebSocket :9000）
+cd /home/karthus_chen/ycb_ws/Psi0
+source .venv-openpi/bin/activate
+bash baselines/pi05/serve_pi05_sonic.sh \
+  --model-path /home/karthus_chen/ycb_ws/checkpoints/PI05_40k_g1_sonic_walk_to_table_place_apple_on_pink_plate_100 \
+  --ckpt-step 40000 \
+  --port 9000
 
+# 终端 2：启动开环推理端
+cd /home/karthus_chen/ycb_ws/Psi0
+source .venv-openpi/bin/activate
+python baselines/pi05/openloop_pi05_g1_real.py \
+  --data-root /home/karthus_chen/ycb_ws/datasets/SONIC/walk_to_table_and_place_apple_on_pink_plate \
+  --ckpt-step 40000 \
+  --episode-idx 1 \
+  --host localhost \
+  --port 9000
 ```
 
 ### 闭环推理
 ```bash
+# 终端 1：G1 机载 Brainco hand + SONIC composed_camera（PUB :5555）
+ssh unitree@192.168.123.164
+bash ./sonic_start_teleop.sh
 
+# 终端 2：SONIC C++ deploy（--input-type zmq_manager，订阅 :5556）
+cd /home/karthus_chen/ycb_ws/Psi0
+
+bash ./real/SONIC/scripts/collect_psi0-sonic-data-manual.sh deploy
+
+# 终端 3：enable_control 进入 PLANNER 并站稳，然后释放 :5556
+cd /home/karthus_chen/ycb_ws/Psi0
+source .venv-psi/bin/activate
+
+python scripts/replay/enable_control.py
+
+# 终端 4：启动 π0.5 PolicyServer（WebSocket :9000）
+cd /home/karthus_chen/ycb_ws/Psi0
+source .venv-openpi/bin/activate
+
+bash baselines/pi05/serve_pi05_sonic.sh \
+  --model-path /home/karthus_chen/ycb_ws/checkpoints/PI05_40k_g1_sonic_walk_to_table_place_apple_on_pink_plate_100 \
+  --ckpt-step 40000 \
+  --port 9000
+
+# 终端 5：π0.5 client（右目相机 → 68D → token ZMQ + Brainco DDS）
+cd /home/karthus_chen/ycb_ws/Psi0
+source .venv-openpi/bin/activate
+
+python real/deploy/pi05_inference.py \
+  --host localhost \
+  --port 9000 \
+  --camera-address tcp://192.168.123.164:5555 \
+  --eef brainco \
+  --dds-interface enp5s0 \
+  --instruction "Go to the table, pick up the apple, place the apple on the pink plate." \
+  --ckpt-step 40000 \
+  --save-pred-action /home/karthus_chen/ycb_ws/Psi0/eval/walk_to_table_and_place_apple_on_pink_plate \
+  --execute-horizon 24
 ```

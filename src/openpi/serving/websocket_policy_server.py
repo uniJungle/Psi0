@@ -62,13 +62,20 @@ class WebsocketPolicyServer:
                 obs = msgpack_numpy.unpackb(await websocket.recv())
 
                 infer_time = time.monotonic()
-                print(f"Received instruction: {obs['prompt']}")
-                if infer_time - self.serve_time > 30 or obs.get("reset", False): # if idle more than 30s or reset flag is set, reset torso_rpyh
-                    self.torso_rpyh = np.array([0, 0, 0, INIT_BASE_HEIGHT], dtype=np.float32)
-                    print("Reset torso_rpyh to default.") 
-                print(f"Torso rpyh: {self.torso_rpyh}")
+                print(f"Received instruction: {obs.get('prompt')}")
 
-                obs["states"] = np.concatenate([obs["states"], self.torso_rpyh], axis=0)
+                # Legacy HFM path: client sent ~28D proprio and server appended torso RPY+height.
+                # SONIC G1 (33D state / 68D action) already includes full proprio — do not concat.
+                states = np.asarray(obs["states"], dtype=np.float32).reshape(-1)
+                use_hfm_torso = states.size <= 28
+                if use_hfm_torso:
+                    if infer_time - self.serve_time > 30 or obs.get("reset", False):
+                        self.torso_rpyh = np.array([0, 0, 0, INIT_BASE_HEIGHT], dtype=np.float32)
+                        print("Reset torso_rpyh to default.")
+                    print(f"Torso rpyh: {self.torso_rpyh}")
+                    obs["states"] = np.concatenate([states, self.torso_rpyh], axis=0)
+                else:
+                    obs["states"] = states
 
                 action = self._policy.infer(obs)
                 # print(f"Sending action: {action}")
@@ -81,7 +88,8 @@ class WebsocketPolicyServer:
                     # We can only record the last total time since we also want to include the send time.
                     action["server_timing"]["prev_total_ms"] = prev_total_time * 1000
                 
-                self.torso_rpyh = action["actions"][-1, 28:32]
+                if use_hfm_torso:
+                    self.torso_rpyh = action["actions"][-1, 28:32]
 
                 await websocket.send(packer.pack(action))
                 prev_total_time = time.monotonic() - start_time
