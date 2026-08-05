@@ -608,3 +608,51 @@ bash baselines/act/train_act_g1_real.sh walk_to_table_and_place_apple # 真机�
 |  0%   42C    P1             68W /  360W |    3571MiB /  16303MiB |      0%      Default |
 |                                         |                        |                  N/A |
 +-----------------------------------------+------------------------+----------------------+
+## 6.2 psi0
+训练：
+```bash
+# Launch the training script via tmux
+tmux new -s train_psi0
+cd /sh/zzy/Psi0
+export WANDB_API_KEY='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'
+wandb login
+bash train_psi0.sh
+```
+闭环推理：
+```bash
+# 终端 1：G1 机载 Brainco hand + SONIC composed_camera（PUB :5555）
+ssh unitree@192.168.123.164
+bash ./sonic_start_teleop.sh
+
+# 终端 2：SONIC C++ deploy（--input-type zmq_manager，订阅 :5556）
+cd /home/karthus_chen/ycb_ws/Psi0
+bash ./real/SONIC/scripts/collect_psi0-sonic-data-manual.sh deploy
+
+# 终端 3：enable_control 进入 PLANNER 并站稳，然后释放 :5556
+cd /home/karthus_chen/ycb_ws/Psi0
+source .venv-psi/bin/activate
+
+python scripts/replay/enable_control.py
+
+# 终端 4：启动 Psi0 policy server（RTC WebSocket :8014）
+cd /home/karthus_chen/ycb_ws/Psi0
+source .venv-psi/bin/activate
+
+export CHECKPOINT_DIR=/home/karthus_chen/ycb_ws/checkpoints/PSI0_40k_g1_sonic_walk_to_table_and_place_apple_on_pink_plate_100
+export CHECKPOINT_STEP=40000
+bash ./scripts/deploy/serve_psi0-rtc-sonic.sh
+
+# 终端 5：Psi0 RTC client（WebSocket → 68D action → token + Brainco DDS）
+cd /home/karthus_chen/ycb_ws/Psi0
+source third_party/GR00T-WholeBodyControl/.venv_teleop/bin/activate
+
+python real/deploy/psi_inference.py \
+  --host localhost \
+  --port 8014 \
+  --camera-address tcp://192.168.123.164:5555 \
+  --eef brainco \
+  --dds-interface enp5s0 \
+  --instruction "Go to the table, pick up the apple, place the apple on the pink plate." \
+  --ckpt-step 40000 \
+  --save-pred-action /home/karthus_chen/ycb_ws/datasets/SONIC/walk_to_table_and_place_apple_on_pink_plate
+```
