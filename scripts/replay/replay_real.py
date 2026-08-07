@@ -8,10 +8,12 @@ Usage:
     # 2. (Optional) Stand up / handoff 5556:
     python scripts/replay/enable_control.py
 
-    # 3. Replay body tokens via ZMQ; Brainco hands via DDS when dataset is 2D
-    #    (--eef auto) or forced with --eef brainco. Do NOT run pico at the same time.
+    # 3. Replay body tokens via ZMQ; hands via DDS with --eef brainco|dex1
+    #    (Do NOT run pico at the same time).
     python scripts/replay/replay_real.py --mode token --episode_idx 0 \
         --data_dir /path/to/halt_stand --eef brainco --dds-interface enp4s0
+    python scripts/replay/replay_real.py --mode token --episode_idx 0 \
+        --data_dir /path/to/test_dex1 --eef dex1 --dds-interface enp5s0
 
 Architecture (same host as C++ --zmq-host, usually the workstation):
     [LeRobot Dataset] --> [replay_real.py] --bind--> tcp://*:5556 (PUB)
@@ -21,6 +23,7 @@ Architecture (same host as C++ --zmq-host, usually the workstation):
                                                          |
                                               DDS / Unitree --> real robot body
     [teleop.*_hand_joints 2D] --> Brainco DDS --> brainco_hand.service --> fingers
+    [teleop.*_hand_joints 1D] --> Dex1 DDS (rt/dex1/*/cmd) --> grippers
 
 ZMQ Protocol:
     - planner mode: "planner" topic with upper_body_position (arm joints 14D)
@@ -57,10 +60,10 @@ if _UNITREE_SDK.is_dir():
     sys.path.insert(0, str(_UNITREE_SDK))
 
 
-def _ensure_brainco_deps() -> None:
-    """Make unitree_sdk2py + cyclonedds importable in .venv-psi.
+def _ensure_dds_hand_deps() -> None:
+    """Make unitree_sdk2py + cyclonedds (+ logging_mp for Dex1) importable in .venv-psi.
 
-    Brainco DDS needs unitree_sdk2py (vendored) and cyclonedds (usually installed
+    Brainco/Dex1 DDS need unitree_sdk2py (vendored) and cyclonedds (usually installed
     in GR00T ``.venv_teleop``). Prefer borrowing that site-packages when missing.
     """
     if _UNITREE_SDK.is_dir() and str(_UNITREE_SDK) not in sys.path:
@@ -80,12 +83,16 @@ def _ensure_brainco_deps() -> None:
         import unitree_sdk2py  # noqa: F401
     except ImportError as exc:
         raise ImportError(
-            "Brainco needs unitree_sdk2py + cyclonedds. Install teleop deps:\n"
+            "Brainco/Dex1 need unitree_sdk2py + cyclonedds. Install teleop deps:\n"
             "  cd third_party/GR00T-WholeBodyControl && bash install_scripts/install_pico.sh\n"
             "Or: uv pip install -e external_dependencies/unitree_sdk2_python && "
             "uv pip install cyclonedds\n"
             f"Original error: {exc}"
         ) from exc
+
+
+# Backward-compatible alias
+_ensure_brainco_deps = _ensure_dds_hand_deps
 
 
 from gear_sonic.utils.teleop.zmq.zmq_planner_sender import (
@@ -163,6 +170,26 @@ def extract_brainco_2d(frame: dict[str, Any]) -> tuple[np.ndarray, np.ndarray]:
     return left[:2], right[:2]
 
 
+def extract_dex1_1d(frame: dict[str, Any]) -> tuple[float, float]:
+    """Extract Dex1 1D gripper commands from a frame (already scaled, typically [0, 5.5])."""
+    left = _as_1d(frame.get("teleop.left_hand_joints"), np.zeros(0))
+    right = _as_1d(frame.get("teleop.right_hand_joints"), np.zeros(0))
+    # Fall back to tail of observation.state / action.wbc (31D = body29 + L1 + R1).
+    if left.size < 1 or right.size < 1:
+        state = _as_1d(
+            frame.get("action.wbc"),
+            _as_1d(frame.get("states"), _as_1d(frame.get("observation.state"), np.zeros(31))),
+        )
+        if state.size >= 31:
+            if left.size < 1:
+                left = state[29:30]
+            if right.size < 1:
+                right = state[30:31]
+    left_v = float(left.reshape(-1)[0]) if left.size >= 1 else 0.0
+    right_v = float(right.reshape(-1)[0]) if right.size >= 1 else 0.0
+    return left_v, right_v
+
+
 def extract_action_token(frame: dict[str, Any]) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Extract motion token and hand joints from a dataset frame.
 
@@ -191,7 +218,7 @@ def extract_action_token(frame: dict[str, Any]) -> tuple[np.ndarray, np.ndarray,
 
 def create_brainco_hand(dds_interface: str):
     """Create active Brainco DDS driver for hand replay (same path as pico teleop)."""
-    _ensure_brainco_deps()
+    _ensure_dds_hand_deps()
     from eef.brainco.brainco import Brainco
 
     print(
@@ -218,6 +245,32 @@ def shutdown_brainco_hand(hand) -> None:
     except Exception as exc:
         print(f"[ReplayReal] Brainco close failed: {exc}")
     print("[ReplayReal] Brainco shutdown complete")
+
+
+def create_dex1_hand(dds_interface: str):
+    """Create active Dex1 DDS driver for gripper replay (same path as pico teleop)."""
+    _ensure_dds_hand_deps()
+    from eef.dex1.dex1 import Dex1
+
+    print(
+        f"[ReplayReal] Initializing Dex1 "
+        f"(dds_interface={dds_interface or 'default'})..."
+    )
+    hand = Dex1(network_interface=dds_interface or None)
+    hand.set_gripper_ratios(0.0, 0.0)
+    print("[ReplayReal] Dex1 ready — will replay teleop.*_hand_joints (1D) via DDS")
+    return hand
+
+
+def shutdown_dex1_hand(hand) -> None:
+    if hand is None:
+        return
+    try:
+        hand.set_gripper_ratios(0.0, 0.0)
+        time.sleep(0.1)
+    except Exception as exc:
+        print(f"[ReplayReal] Dex1 reset-on-exit failed: {exc}")
+    print("[ReplayReal] Dex1 shutdown complete")
 
 
 def extract_action_joints(frame: dict[str, Any]) -> dict[str, np.ndarray]:
@@ -349,11 +402,15 @@ def resolve_episode_videos(
         "observation.images.ego_view_left",
         "observation.images.ego_view",
         "observation.images.ego_view_right",
+        "observation.images.left_wrist",
+        "observation.images.right_wrist",
     ]
     found = [k for k, v in features.items() if isinstance(v, dict) and v.get("dtype") == "video"]
     video_keys = [k for k in preferred if k in found]
-    if not video_keys:
-        video_keys = sorted(found)
+    # Keep any remaining video keys after preferred order.
+    for key in sorted(found):
+        if key not in video_keys:
+            video_keys.append(key)
 
     resolved: list[tuple[str, Path]] = []
     for key in video_keys:
@@ -400,8 +457,12 @@ class EpisodeVideoPreview:
         if self.task_prompt:
             print(f"[ReplayReal] Task prompt: {self.task_prompt}")
 
+        n_views = len(self.caps)
+        # Always one row: 2-view → 1280x480; 4-view → wider single strip.
+        win_w = 1280 if n_views <= 2 else 1920
+        win_h = 480
         cv2.namedWindow(self.WINDOW_NAME, cv2.WINDOW_NORMAL)
-        cv2.resizeWindow(self.WINDOW_NAME, 1280, 480)
+        cv2.resizeWindow(self.WINDOW_NAME, win_w, win_h)
 
     def _draw_overlay(self, canvas: Any, frame_idx: int) -> None:
         """Draw frame index + task-prompt on the concatenated preview canvas."""
@@ -455,6 +516,18 @@ class EpisodeVideoPreview:
                 self._cv2.LINE_AA,
             )
 
+    @staticmethod
+    def _hstack_match_height(cv2, frames: list[Any]) -> Any:
+        h = min(f.shape[0] for f in frames)
+        resized = []
+        for f in frames:
+            if f.shape[0] != h:
+                scale = h / f.shape[0]
+                w = max(1, int(f.shape[1] * scale))
+                f = cv2.resize(f, (w, h))
+            resized.append(f)
+        return np.concatenate(resized, axis=1) if len(resized) > 1 else resized[0]
+
     def show_frame(self, frame_idx: int) -> None:
         frames = []
         for key, cap in self.caps:
@@ -477,16 +550,8 @@ class EpisodeVideoPreview:
         if not frames:
             return
 
-        # Match heights then concatenate left|right (or single view).
-        h = min(f.shape[0] for f in frames)
-        resized = []
-        for f in frames:
-            if f.shape[0] != h:
-                scale = h / f.shape[0]
-                w = max(1, int(f.shape[1] * scale))
-                f = self._cv2.resize(f, (w, h))
-            resized.append(f)
-        canvas = np.concatenate(resized, axis=1) if len(resized) > 1 else resized[0]
+        # One row, N columns (ego L|R then wrists L|R when all four present).
+        canvas = self._hstack_match_height(self._cv2, frames)
         self._draw_overlay(canvas, frame_idx)
         self._cv2.imshow(self.WINDOW_NAME, canvas)
         self._cv2.waitKey(1)
@@ -671,7 +736,7 @@ class ReplayReal:
         warmup_seconds: float = 2.0,
         handoff_seconds: float = 2.0,
         stop_on_exit: bool = False,
-        eef: str = "auto",
+        eef: str = "none",
         dds_interface: str = "enp4s0",
         show_video: bool = True,
         no_robot: bool = False,
@@ -686,8 +751,8 @@ class ReplayReal:
             mode: "planner" for direct joint values, "token" for motion_token
             input_type: "zmq_manager" (auto-start on first pose) or "manager" (manual)
             warmup_seconds: Time to wait after start command
-            eef: "auto" (2D hand joints → brainco), "none", or "brainco"
-            dds_interface: NIC for Brainco DDS
+            eef: "none", "brainco", or "dex1"
+            dds_interface: NIC for Brainco/Dex1 DDS
             show_video: Open OpenCV window with episode ego videos
             no_robot: Preview-only mode; skip ZMQ / DDS and ignore eef
         """
@@ -707,6 +772,7 @@ class ReplayReal:
         self.running = True
         self._handoff_done = False
         self.brainco_hand = None
+        self.dex1_hand = None
         self.video_preview: Optional[EpisodeVideoPreview] = None
         self.zmq: Optional[ReplayZMQClient] = None
 
@@ -737,21 +803,15 @@ class ReplayReal:
             if self.eef != "none":
                 print(f"[ReplayReal] --no-robot enabled; ignoring --eef={self.eef}")
             self.eef = "none"
-            print("[ReplayReal] Preview-only mode: skipping robot ZMQ and Brainco DDS")
+            print("[ReplayReal] Preview-only mode: skipping robot ZMQ and hand DDS")
         else:
-            if self.eef == "auto":
-                sample = _as_1d(self.df.iloc[0].get("teleop.left_hand_joints"), np.zeros(0))
-                self.eef = "brainco" if sample.size == 2 else "none"
-                print(
-                    f"[ReplayReal] --eef auto → {self.eef} "
-                    f"(teleop.left_hand_joints dim={sample.size})"
-                )
-
             if self.eef == "brainco":
                 self.brainco_hand = create_brainco_hand(self.dds_interface)
+            elif self.eef == "dex1":
+                self.dex1_hand = create_dex1_hand(self.dds_interface)
             elif self.eef not in ("", "none"):
                 raise ValueError(
-                    f"Unsupported --eef={self.eef!r}. Use 'auto', 'none', or 'brainco'."
+                    f"Unsupported --eef={self.eef!r}. Use 'none', 'brainco', or 'dex1'."
                 )
 
             # ZMQ PUB must bind on the same host that C++ --zmq-host connects to.
@@ -790,6 +850,12 @@ class ReplayReal:
         print(f"\n[ReplayReal] Signal {sig}, stopping replay loop...")
         self.running = False
 
+    def _shutdown_hands(self) -> None:
+        shutdown_brainco_hand(self.brainco_hand)
+        self.brainco_hand = None
+        shutdown_dex1_hand(self.dex1_hand)
+        self.dex1_hand = None
+
     def _handoff_to_idle_planner(self):
         """After replay: PLANNER + idle, release port, keep deploy running."""
         if self._handoff_done:
@@ -797,8 +863,7 @@ class ReplayReal:
         self._handoff_done = True
 
         if self.zmq is None or self.zmq.sock is None:
-            shutdown_brainco_hand(self.brainco_hand)
-            self.brainco_hand = None
+            self._shutdown_hands()
             if self.video_preview is not None:
                 self.video_preview.close()
                 self.video_preview = None
@@ -807,8 +872,7 @@ class ReplayReal:
         if self.stop_on_exit:
             print("[ReplayReal] Sending stop command (--stop-on-exit)...")
             self.zmq.release(send_stop=True)
-            shutdown_brainco_hand(self.brainco_hand)
-            self.brainco_hand = None
+            self._shutdown_hands()
             if self.video_preview is not None:
                 self.video_preview.close()
                 self.video_preview = None
@@ -829,8 +893,7 @@ class ReplayReal:
 
         self.zmq.release(send_stop=False)
         print("[ReplayReal] Done — deploy still running in idle PLANNER")
-        shutdown_brainco_hand(self.brainco_hand)
-        self.brainco_hand = None
+        self._shutdown_hands()
         if self.video_preview is not None:
             self.video_preview.close()
             self.video_preview = None
@@ -840,6 +903,8 @@ class ReplayReal:
         print(f"[ReplayReal] Starting replay at {self.fps} Hz, mode={self.mode}, input_type={self.input_type}")
         if self.brainco_hand is not None:
             print("[ReplayReal] Brainco hand replay enabled (DDS 2D targets)")
+        if self.dex1_hand is not None:
+            print("[ReplayReal] Dex1 gripper replay enabled (DDS 1D targets)")
         if self.video_preview is not None:
             print("[ReplayReal] Video preview window: 'Replay Video' (synced to frame index)")
         if self.no_robot:
@@ -880,6 +945,9 @@ class ReplayReal:
                 if self.brainco_hand is not None:
                     left_2d, right_2d = extract_brainco_2d(frame)
                     self.brainco_hand.set_2d_targets(left_2d, right_2d)
+                if self.dex1_hand is not None:
+                    left_1d, right_1d = extract_dex1_1d(frame)
+                    self.dex1_hand.set_gripper_ratios(left_1d, right_1d)
 
                 if self.video_preview is not None:
                     self.video_preview.show_frame(frame_idx)
@@ -984,15 +1052,15 @@ Input type:
     parser.add_argument(
         "--eef",
         type=str,
-        default="auto",
-        choices=["auto", "none", "brainco"],
-        help="End-effector: auto (2D teleop hands→brainco DDS), brainco, or none",
+        default="none",
+        choices=["none", "brainco", "dex1"],
+        help="End-effector DDS replay: none, brainco (2D), or dex1 (1D)",
     )
     parser.add_argument(
         "--dds-interface",
         type=str,
         default="enp4s0",
-        help="NIC for Brainco DDS (default: enp4s0)",
+        help="NIC for Brainco/Dex1 DDS (default: enp4s0)",
     )
     parser.add_argument(
         "--no-video",
@@ -1031,6 +1099,7 @@ Input type:
         replay._handoff_to_idle_planner()
     finally:
         shutdown_brainco_hand(getattr(replay, "brainco_hand", None))
+        shutdown_dex1_hand(getattr(replay, "dex1_hand", None))
 
 if __name__ == "__main__":
     # Import zmq and json at top level

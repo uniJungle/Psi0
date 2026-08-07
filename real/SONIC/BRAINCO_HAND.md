@@ -70,6 +70,7 @@ cd third_party/GR00T-WholeBodyControl
 bash install_scripts/install_pico.sh
 source .venv_teleop/bin/activate
 python -c "from eef.brainco.brainco import Brainco; print('OK')"
+python -c "from eef.dex1.dex1 import Dex1; print('OK')"
 ```
 
 若环境已存在，只需确保 editable 安装包含 `eef`，并已安装 `unitree_sdk2_python`：
@@ -100,8 +101,3 @@ bash ./real/SONIC/scripts/collect_psi0-sonic-data-manual.sh pico --eef none
 
 冒烟：启动后按 trigger，终端应出现 `[Brainco] trigger L=.. R=..`，双手开合。  
 有日志但手不动 → 查 `brainco_hand` 是否 active、网卡是否正确。
-
-## 当前限制
-
-- 本阶段 **不把 Brainco 关节写入** SONIC LeRobot（exporter 手字段仍可能是 Dex3/占位）。
-- `deploy` 仍可能向 Dex3 topic 发命令；无 Dex3 硬件时可忽略。

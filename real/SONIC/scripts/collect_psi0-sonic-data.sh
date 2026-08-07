@@ -23,6 +23,7 @@ FPS=30
 OUTPUT_DIR="/home/karthus_chen/ycb_ws/datasets/SONIC"
 EEF="brainco"
 DDS_INTERFACE="enp4s0"
+USE_WRIST_CAMERAS=false
 
 SONIC_DIR="$(cd "$(dirname "$0")/../../../third_party/GR00T-WholeBodyControl" && pwd)"
 cd "$SONIC_DIR"
@@ -54,9 +55,13 @@ while [ $# -gt 0 ]; do
             DDS_INTERFACE="$2"
             shift 2
             ;;
+        --use-wrist-cameras|--record-wrist-cameras)
+            USE_WRIST_CAMERAS=true
+            shift
+            ;;
         --*)
             echo "Unknown argument: $1"
-            echo "Usage: $0 [sim|<ROBOT_IP>] [--task-prompt TEXT] [--task-name NAME] [--root-output-dir DIR] [--eef none|brainco] [--dds-interface IFACE]"
+            echo "Usage: $0 [sim|<ROBOT_IP>] [--task-prompt TEXT] [--task-name NAME] [--root-output-dir DIR] [--eef none|brainco|dex1] [--dds-interface IFACE] [--use-wrist-cameras]"
             exit 1
             ;;
         *)
@@ -97,6 +102,11 @@ else
       python gear_sonic/scripts/run_camera_viewer.py --camera-host "$MODE" --camera-port 5555 ) &
     PREVIEW_PID=$!
 
+    EXTRA_CAMERA_ARGS=""
+    if [ "$USE_WRIST_CAMERAS" = true ]; then
+        EXTRA_CAMERA_ARGS="--record-wrist-cameras"
+    fi
+
     python gear_sonic/scripts/launch_data_collection.py \
         --camera-host "$MODE" \
         --task-prompt "$TASK" \
@@ -104,6 +114,7 @@ else
         --data-exporter-frequency "$FPS" \
         --root-output-dir "$OUTPUT_DIR" \
         --record-stereo-ego \
+        $EXTRA_CAMERA_ARGS \
         --pico-eef "$EEF" \
         --pico-dds-interface "$DDS_INTERFACE" \
         --no-camera-viewer

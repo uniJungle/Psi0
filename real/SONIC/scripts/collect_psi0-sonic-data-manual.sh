@@ -13,6 +13,8 @@
 # PICO options (defaults: Brainco on enp4s0):
 #   bash ./real/SONIC/scripts/collect_psi0-sonic-data-manual.sh pico \
 #       --eef brainco --dds-interface enp4s0
+#   bash ./real/SONIC/scripts/collect_psi0-sonic-data-manual.sh pico \
+#       --eef dex1 --dds-interface enp4s0
 #   bash ./real/SONIC/scripts/collect_psi0-sonic-data-manual.sh pico --eef none
 #
 # Exporter camera (required; mutually exclusive):
@@ -34,6 +36,7 @@ OUTPUT_DIR="$PSI0_ROOT/outputs/SONIC"
 EEF="brainco"
 DDS_INTERFACE="enp4s0"
 CAMERA_MODE=""  # stereo | mono
+RECORD_WRIST_CAMERAS=false
 LOW_LATENCY=false
 
 SONIC_DIR="$(cd "$PSI0_ROOT/third_party/GR00T-WholeBodyControl" && pwd)"
@@ -45,10 +48,12 @@ Options:
   --task-prompt TEXT
   --task-name NAME
   --root-output-dir DIR
-  --eef {none|brainco|dex3}     (pico: none|brainco; exporter: dex3|brainco; default: brainco)
+  --eef {none|brainco|dex1|dex3} (pico: none|brainco|dex1; exporter: dex3|brainco|dex1; default: brainco)
   --dds-interface IFACE         (pico/exporter; default: enp4s0)
   --use-stereo-camera           (exporter; stereo ego_view_left/right)
-  --use-mono-camera             (exporter; mono ego_view)"
+  --use-mono-camera             (exporter; mono ego_view)
+  --record-wrist-cameras       (exporter; additionally record left_wrist/right_wrist)
+  --use-wrist-cameras          (exporter; alias of --record-wrist-cameras)"
 
 MODE="${1:-}"
 if [ -z "$MODE" ]; then
@@ -107,6 +112,14 @@ while [ $# -gt 0 ]; do
                 exit 1
             fi
             CAMERA_MODE="mono"
+            shift
+            ;;
+        --record-wrist-cameras)
+            RECORD_WRIST_CAMERAS=true
+            shift
+            ;;
+        --use-wrist-cameras)
+            RECORD_WRIST_CAMERAS=true
             shift
             ;;
         *)
@@ -179,6 +192,9 @@ case "$MODE" in
         )
         if [ "$CAMERA_MODE" = "stereo" ]; then
             EXPORTER_ARGS+=(--record-stereo-ego)
+        fi
+        if [ "$RECORD_WRIST_CAMERAS" = true ]; then
+            EXPORTER_ARGS+=(--record-wrist-cameras)
         fi
         echo "[exporter] camera=$CAMERA_MODE"
         python gear_sonic/scripts/run_data_exporter.py "${EXPORTER_ARGS[@]}"

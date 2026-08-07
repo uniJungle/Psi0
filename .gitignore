@@ -15,6 +15,7 @@ cache
 ml-egodex_dataset/ # soft link to the egodex dataset
 wandb/
 runs/
+eval/
 checkpoints/
 log/
 playgrounds/

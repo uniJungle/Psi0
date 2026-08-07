@@ -11,7 +11,8 @@ git fetch origin
 git checkout g1_setup
 ```
 
-Brainco 灵巧手在 SONIC 数采中的安装、通信机制与依赖说明见：[real/SONIC/BRAINCO_HAND.md](real/SONIC/BRAINCO_HAND.md)。
+Brainco 灵巧手在 SONIC 数采中的安装、通信机制与依赖说明见：[real/SONIC/BRAINCO_HAND.md](real/SONIC/BRAINCO_HAND.md)
+Dex1 灵巧手在 SONIC 数采中的安装、通信机制与依赖说明见：[real/SONIC/DEX1_GRIPPER.md](real/SONIC/DEX1_GRIPPER.md)
 
 ## 在机器人端添加图像/末端启动脚本
 
@@ -19,8 +20,9 @@ Brainco 灵巧手在 SONIC 数采中的安装、通信机制与依赖说明见�
 
     ```bash
     ssh unitree@192.168.123.164
+    conda create -n vision python=3.8
     conda activate vision
-    pip install msgpack msgpack-numpy tyro
+    pip install msgpack msgpack-numpy tyro pyrealsense2 opencv-python zmq numpy
     ```
 
 2. 从工作站拷贝 SONIC 相机模块到机器人（在工作站 submodule 根目录执行）：
@@ -38,18 +40,27 @@ Brainco 灵巧手在 SONIC 数采中的安装、通信机制与依赖说明见�
 
     ```bash
     cd ~/ycb_ws/Psi0
+
+    # 仅头部 USB 双目相机
     scp real/SONIC/scripts/sonic_start_teleop.sh unitree@192.168.123.164:~/
+
+    # 头部 USB 双目相机 + 双腕 Realsense D405 RGB
+    scp real/SONIC/scripts/sonic_start_teleop_dex1.sh unitree@192.168.123.164:~/
     ```
 
 ## 数据采集
 
-### 1. 启动 G1 机载图像服务与 Brainco 手部服务
+### 1. 启动 G1 机载图像服务与末端手部服务
 
 1. 通过 tmux 一并启动两个服务：
 
     ```bash
     ssh unitree@192.168.123.164
+    # Brainco 手
     bash ./sonic_start_teleop.sh
+
+    # Dex1 夹爪 + 双腕 D405
+    bash ./sonic_start_teleop_dex1.sh
     ```
 
 2. 仅启动图像服务：
@@ -67,6 +78,13 @@ Brainco 灵巧手在 SONIC 数采中的安装、通信机制与依赖说明见�
     # 发布单目流：`ego_view`，640×480
     python -m gear_sonic.camera.composed_camera \
         --ego-view-camera usb --ego-view-device-id 0 \
+        --port 5555
+
+    # 发布四路流：`ego_view_left` / `ego_view_right` / `left_wrist` / `right_wrist`，640×480
+    python -m gear_sonic.camera.composed_camera \
+        --ego-view-camera usb_stereo --ego-view-device-id 0 \
+        --left-wrist-camera realsense --left-wrist-device-id "260322276690" \
+        --right-wrist-camera realsense --right-wrist-device-id "260322275012" \
         --port 5555
 
     # 在工作站检查相机画面
@@ -89,6 +107,7 @@ Brainco 灵巧手在 SONIC 数采中的安装、通信机制与依赖说明见�
 ### 2. 启动 SONIC C++ 控制器
 
 ```bash
+cd /home/karthus_chen/ycb_ws/Psi0
 bash ./real/SONIC/scripts/collect_psi0-sonic-data-manual.sh deploy
 
 # 低延迟模式 --low-latency
@@ -97,9 +116,10 @@ bash ./real/SONIC/scripts/collect_psi0-sonic-data-manual.sh deploy
 ### 3. 启动 PICO 遥操作系统
 
 ```bash
+cd /home/karthus_chen/ycb_ws/Psi0
 bash ./real/SONIC/scripts/collect_psi0-sonic-data-manual.sh pico \
-    --eef brainco \
-    --dds-interface enp4s0
+    --eef dex1 \
+    --dds-interface enp5s0
 ```
 
 安装、DDS 通信与依赖见 [BRAINCO_HAND.md](real/SONIC/BRAINCO_HAND.md)。
@@ -107,21 +127,23 @@ bash ./real/SONIC/scripts/collect_psi0-sonic-data-manual.sh pico \
 ### 4. 启动数据录制 / 导出脚本
 
 ```bash
-# 双目：ego_view_left / ego_view_right
+cd /home/karthus_chen/ycb_ws/Psi0
+# 四路：ego_view_left / ego_view_right + left_wrist / right_wrist
 bash ./real/SONIC/scripts/collect_psi0-sonic-data-manual.sh exporter \
-    --task-prompt "Go to the table, pick up the apple, place the apple on the pink plate." \
-    --task-name "walk_to_table_and_place_apple_on_pink_plate" \
-    --root-output-dir /home/karthus_chen/ycb_ws/datasets/SONIC/ \
+    --task-prompt "This is a test" \
+    --task-name "test_dex1" \
+    --root-output-dir /home/karthus_chen/ycb_ws/datasets/sonic \
     --use-stereo-camera \
-    --dds-interface enp4s0 \
-    --eef brainco
+    --use-wrist-cameras \
+    --dds-interface enp5s0 \
+    --eef dex1
 
 # 单目：ego_view 选择 --use-mono-camera
 ```
 
 ### 5. 操作键位
 
-1. **进入遥操作**（deploy 终端 / PICO）：校准姿态 → **A+B+X+Y** → **A+X**
+1. **进入遥操作**（deploy 终端 | PICO）：校准姿态 → **A+B+X+Y** → **A+X**
 2. **模式切换**（PICO，在已启动策略后）：
     - **A+X**：遥操（POSE）↔ 规划（PLANNER）
     - **Y**：遥操暂停 ↔ 恢复遥操
@@ -129,7 +151,7 @@ bash ./real/SONIC/scripts/collect_psi0-sonic-data-manual.sh exporter \
 3. **规划模式移动**（进入 PLANNER 后）：
     - 默认即锁定 **SLOW_WALK**：左摇杆可直接平移，右摇杆左右控制朝向
     - 松杆时下发 IDLE，机器人站定
-4. **双手开合**（Brainco，PICO；manager 启动后即可用）：
+4. **末端开合**（Brainco | Dex1 | Dex3）：
     - **左 trigger**：左手开合
     - **右 trigger**：右手开合
     - 终端应周期性打印 `[Brainco] trigger L=.. R=..`；若有打印但手不动，查机器人 `brainco_hand` / DDS 网卡
@@ -172,9 +194,9 @@ python scripts/replay/replay_real.py \
   --input_type zmq_manager \
   --dds-interface enp5s0 \
   --zmq_port 5556 \
-  --eef brainco \
+  --eef dex1 \
   --mode token \
-  --data_dir /home/karthus_chen/ycb_ws/datasets/SONIC/walk_to_table_and_place_apple_on_pink_plate/closeloop_act_40k/lerobot_v2.1 \
+  --data_dir /home/karthus_chen/ycb_ws/datasets/sonic/test_dex1 \
   --episode_idx 0
 ```
 
