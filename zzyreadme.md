@@ -349,7 +349,7 @@ chmod +x scripts/install_deps.sh
 ./scripts/install_deps.sh
 source scripts/setup_env.sh
 echo "source $(pwd)/scripts/setup_env.sh" >> ~/.bashrc
-
+just build
 ```
 ## 5.1 仿真遥操作测试
 psi原生自动化方式：
